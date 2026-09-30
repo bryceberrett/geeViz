@@ -1,50 +1,5 @@
 """
-ArcGIS / Esri REST services client for geeViz. **DEPRECATED.**
-
-.. deprecated::
-   Use :mod:`georest` instead. This module now delegates to it and will
-   be removed in a future release.
-
-   ``georest`` is the maintained implementation of everything here that
-   talks to an Esri REST endpoint, it is stdlib-only (no runtime
-   dependencies), and it does considerably more than this module ever
-   did — ``exportImage``, ``identifyPixelValue``, ``getSamples``,
-   ``computeStatisticsHistograms``, ``queryBoundary``, and a full client
-   for the USFS Enterprise Data Warehouse.
-
-   The move, function by function::
-
-       geeViz.esriLib.searchPortal        -> georest.restesri.portal.searchPortal
-       geeViz.esriLib.getServiceMetadata  -> georest.restesri.portal.getServiceMetadata
-
-   The signatures match, so the change is the import line.
-
-   The ``addEsri*Service`` functions are NOT going to georest: they add
-   layers to a geeViz ``Map``, which is geeViz's concern, not a REST
-   client's. They stay available here (and as ``Map.addEsri*``).
-
-   **This module is a patch over georest, not a fork of it.** What is
-   left here is only what georest should not have:
-
-   * the geeViz ``Map`` calls -- ``addLayer``, ``addTileLayer``,
-     ``addDynamicMapService`` -- and the naming and viz-key handling
-     around them;
-   * :func:`geeViz._ssrf.check_url`, which is this package's policy and
-     has to be applied on THIS side of every delegated call, because
-     georest has none;
-   * the exception contract callers already depend on: georest reports
-     an unreachable host or a bad status as ``RuntimeError``, and this
-     module has always raised ``ConnectionError``, so it translates at
-     the boundary rather than rewriting what callers catch.
-
-   Everything else delegates. ``_resolve_portal``,
-   ``_detect_service_type`` and ``_resolve_url`` were byte-identical
-   copies of georest's and now call them; :data:`PORTALS` is georest's
-   own dict rather than a copy, so a name added at runtime through
-   either module resolves in both; the feature-service count pre-flight,
-   overflow guard and GeoJSON fetch are one call to
-   ``georest.restesri.services.queryFeatureService``; the ``{z}/{y}/{x}``
-   tile template comes from ``getImageServiceTileUrl``.
+ArcGIS / Esri REST services client for geeViz.
 
 Bridges three Esri service types into the existing geeViz viewer with no
 JavaScript changes required.  The viewer already supports both
@@ -106,7 +61,6 @@ You may obtain a copy of the License at
 from __future__ import annotations
 
 import json
-import warnings
 import time
 import urllib.error
 import urllib.parse
@@ -118,15 +72,14 @@ from geeViz._ssrf import check_url as _check_url  # noqa: E402
 # Known public portals
 # ---------------------------------------------------------------------------
 
-#: THE SAME OBJECT georest uses, not a copy of it.
-#:
-#: This dict is documented below as runtime-editable, and
-#: ``_resolve_portal`` now delegates to georest -- so a copy would
-#: mean ``esriLib.PORTALS["mine"] = ...`` was accepted and then
-#: silently ignored, because the lookup happens against the other
-#: dict. Aliasing keeps one source of truth and makes an edit
-#: through either name work.
-from georest.restesri.portal import PORTALS  # noqa: E402
+PORTALS: dict[str, str] = {
+    "iipp": "https://imagery.geoplatform.gov/iipp",
+    "agol": "https://www.arcgis.com",
+    "usgs": "https://www.sciencebase.gov/sciencebase",
+    "noaa": "https://coastalatlas.noaa.gov",
+    "usfs": "https://data.fs.usda.gov/geodata",
+    "nasa": "https://nasa.maps.arcgis.com",
+}
 """Module-level dict mapping short names to portal base URLs.
 
 Add your own at runtime::
@@ -178,86 +131,94 @@ _DATA_ONLY_EXCLUSIONS: list[str] = [
 # HTTP helpers (no third-party dependencies — stdlib only)
 # ---------------------------------------------------------------------------
 
-_TIMEOUT = 30  # seconds
-
-
-#: Functions already warned about, so a loop calling one does not emit
-#: the same notice a thousand times. A deprecation is a message to the
-#: person reading the code, not a running cost.
-_WARNED: set[str] = set()
-
-
-def _deprecated(name: str, replacement: str) -> None:
-    """Warn once that ``name`` has moved to ``replacement``.
-
-    ``DeprecationWarning`` is hidden by default in scripts, which is
-    right: this must not spam a notebook that happens to call a geeViz
-    map helper. Anyone running with ``-W default`` or pytest sees it.
-    """
-    if name in _WARNED:
-        return
-    _WARNED.add(name)
-    warnings.warn(
-        f"geeViz.esriLib.{name} is deprecated and now delegates to "
-        f"{replacement}. geeViz.esriLib will be removed in a future "
-        f"release; import georest directly.",
-        DeprecationWarning,
-        stacklevel=3,
-    )
+# LOCAL PATCH retry ladder v2 (2026-09-21): a SUCCESSFUL city-scale count
+# over FEMA NFHL took 18 s (measured 2026-09-21). Timing that out
+# turns a slow layer into a missing one. 45 s is what esri_paging
+# already allows the data path.
+_TIMEOUT = 45  # seconds
 
 
 def _fetch_json(url: str, params: dict | None = None) -> dict:
-    """GET a URL and return parsed JSON, via :mod:`georest`.
+    """GET a URL and return parsed JSON.  Raises ``urllib.error.URLError`` on
+    network failure, ``ValueError`` on non-JSON response.
 
-    The body that used to live here — urlopen, the three-attempt retry
-    on transient statuses, the JSON decode with the response body in the
-    error — is now georest's, and georest is the maintained copy. This
-    is the same code path the retry patch of 2026-09-01 added, kept
-    working for the ``addEsri*`` callers below while they still exist.
-
-    Raises the same things it always did: ``urllib.error.URLError`` on
-    network failure, ``ValueError`` on a non-JSON response.
+    LOCAL PATCH (2026-09-01): retry transient network failures. Measured on
+    hazards.fema.gov: 2 of 8 TLS handshakes were reset (WinError 10054, in
+    bursts), so a single-attempt fetch loses a coin-flip fraction of map
+    draws while the data path (esri_paging, which retries) succeeds on the
+    same layer in the same conversation. Mirrors esri_paging: two retries,
+    backoff, transient statuses only.
     """
-    from georest.restesri import _http as _gh
-
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
-    # _check_url stays on this side: it is geeViz's SSRF guard, and the
-    # url is fully built by the time it runs.
     _check_url(url)
+    req = urllib.request.Request(url, headers={"User-Agent": "geeViz/esriLib"})
+    last_exc: Exception = urllib.error.URLError("no attempt made")
+    # LOCAL PATCH retry ladder v2 (2026-09-21): the ladder was shorter than
+    # the burst. hazards.fema.gov, 24 attempts one second apart:
+    # 7 succeeded, and the longest run of consecutive failures was 7
+    # attempts spanning 7.7 s. Three attempts with 1 s + 2 s of
+    # backoff give up well inside that - and because a reset comes
+    # back in 0.1 s, they were not waiting out anything.
+    for attempt in range(5):
+        if attempt:
+            time.sleep(2 ** (attempt - 1))  # 1, 2, 4, 8 s
+        try:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+                raw = resp.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (429, 500, 502, 503, 504):
+                raise
+            last_exc = exc
+        except (urllib.error.URLError, ConnectionResetError, TimeoutError) as exc:
+            last_exc = exc
+    else:
+        raise last_exc
     try:
-        return _gh.fetch_json(url)
-    except ValueError:
-        # A non-JSON body. Same meaning on both sides — pass it through
-        # rather than flattening it into the network case.
-        raise
-    except RuntimeError as exc:
-        # georest reports an unreachable host or a bad HTTP status as
-        # RuntimeError; this module has always documented and raised
-        # ConnectionError, and callers catch that. Delegation must not
-        # silently change which exception a caller has to handle, so
-        # translate at the boundary rather than rewriting the contract
-        # of a module people already depend on.
-        raise ConnectionError(str(exc)) from exc
-    except urllib.error.URLError as exc:
-        raise ConnectionError(str(exc)) from exc
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Expected JSON from {url!r} but got:\n{raw[:400]}"
+        ) from exc
 
 
 def _build_params(base: dict, token: str | None) -> dict:
-    """Merge ``token`` into a params dict if supplied. Delegates."""
-    from georest.restesri import _http as _gh
-    return _gh.build_params(base, token)
+    """Merge ``token`` into a params dict if supplied."""
+    if token:
+        return {**base, "token": token}
+    return base
 
 
 def _resolve_portal(portal: str) -> str:
-    """Resolve a portal short name or URL to a base URL. Delegates.
+    """Resolve a portal argument to a base URL.
 
-    The body was a byte-identical copy of georest's, which is how the
-    two would have drifted. :data:`PORTALS` is aliased to georest's own
-    dict above, so a name added at runtime resolves here too.
+    Args:
+        portal (str): Either a short name from :data:`PORTALS` (e.g.
+            ``"iipp"``, ``"agol"``) or a full URL
+            (e.g. ``"https://gis.myagency.gov/portal"``).
+
+    Returns:
+        str: Portal base URL with no trailing slash.
+
+    Raises:
+        KeyError: If a short name is given but not found in :data:`PORTALS`.
     """
-    from georest.restesri import portal as _gp
-    return _gp._resolve_portal(portal)
+    if portal.startswith("http://") or portal.startswith("https://"):
+        return portal.rstrip("/")
+    if portal in PORTALS:
+        return PORTALS[portal].rstrip("/")
+    known = ", ".join(f'"{k}"' for k in PORTALS)
+    raise KeyError(
+        f"Unknown portal short name {portal!r}.  Known names: {known}.  "
+        f"Pass a full URL or add your portal to PORTALS first: "
+        f'PORTALS["{portal}"] = "https://..."'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Portal search
+# ---------------------------------------------------------------------------
 
 def searchPortal(
     query: str,
@@ -330,12 +291,59 @@ def searchPortal(
         # Raw portal query DSL (bypasses data_only and filters)
         results = el.searchPortal("", raw_q='type:"Feature Service" owner:USGS')
     """
-    _deprecated("searchPortal", "georest.restesri.portal.searchPortal")
-    from georest.restesri import portal as _gp
-    return _gp.searchPortal(
-        query, portal=portal, limit=limit, data_only=data_only,
-        raw_q=raw_q, token=token, **filters)
+    base_url = _resolve_portal(portal)
+    search_url = f"{base_url}/sharing/rest/search"
 
+    # Assemble the query string
+    if raw_q is not None:
+        q = raw_q
+    else:
+        q = query
+        if data_only:
+            exclusions = " ".join(f'-type:"{t}"' for t in _DATA_ONLY_EXCLUSIONS)
+            q = f"{q} {exclusions}".strip()
+
+    params: dict[str, Any] = {
+        "q": q,
+        "num": min(max(1, limit), 100),
+        "f": "json",
+        **filters,
+    }
+    if token:
+        params["token"] = token
+
+    try:
+        data = _fetch_json(search_url, params)
+    except urllib.error.URLError as exc:
+        raise ConnectionError(
+            f"Could not reach portal at {search_url!r}: {exc}"
+        ) from exc
+
+    items = data.get("results", [])
+    parsed = []
+    for item in items:
+        thumb = item.get("thumbnail")
+        if thumb:
+            thumb = f"{base_url}/sharing/rest/content/items/{item.get('id', '')}/info/{thumb}"
+        parsed.append({
+            "id": item.get("id", ""),
+            "title": item.get("title", ""),
+            "type": item.get("type", ""),
+            "snippet": item.get("snippet", ""),
+            "tags": item.get("tags", []),
+            "url": item.get("url", ""),
+            "owner": item.get("owner", ""),
+            "created": item.get("created"),
+            "modified": item.get("modified"),
+            "thumbnail": thumb,
+            "_raw": item,
+        })
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Service metadata
+# ---------------------------------------------------------------------------
 
 def getServiceMetadata(url: str, token: str | None = None) -> dict[str, Any]:
     """Fetch and return the JSON metadata for any ArcGIS REST service.
@@ -380,38 +388,100 @@ def getServiceMetadata(url: str, token: str | None = None) -> dict[str, Any]:
         meta = el.getServiceMetadata("https://.../FeatureServer/0")
         print([f["name"] for f in meta.get("fields", [])])
     """
-    _deprecated("getServiceMetadata",
-                "georest.restesri.portal.getServiceMetadata")
-    from georest.restesri import portal as _gp
-    _check_url(url)
+    clean_url = url.rstrip("/")
+    params = _build_params({"f": "json"}, token)
     try:
-        return _gp.getServiceMetadata(url, token=token)
-    except (RuntimeError, urllib.error.URLError) as exc:
-        # Same translation as _fetch_json, and for the same reason: this
-        # function has always raised ConnectionError for an unreachable
-        # service, and delegating must not change what a caller catches.
-        raise ConnectionError(str(exc)) from exc
+        return _fetch_json(clean_url, params)
+    except urllib.error.URLError as exc:
+        raise ConnectionError(
+            f"Could not reach service at {clean_url!r}: {exc}"
+        ) from exc
 
+
+# ---------------------------------------------------------------------------
+# Service-type detection
+# ---------------------------------------------------------------------------
 
 def _detect_service_type(url: str, meta: dict | None = None) -> str:
-    """Return the ArcGIS service type for *url*. Delegates.
+    """Return the service type string for *url*.
 
-    ``"ImageServer"``, ``"FeatureServer"``, ``"MapServer"`` or
-    ``"Unknown"``. The body was a byte-identical copy of georest's --
-    URL-segment match first, then metadata keys, then the ``fields`` /
-    ``bandCount`` shape sniff.
+    Detection order:
+    1. URL path segments (fast, no HTTP call needed for clear cases).
+    2. ``meta["type"]`` or ``meta["serviceDataType"]`` if caller already
+       fetched metadata.
+    3. Fetch ``?f=json`` and inspect the response.
+
+    Returns one of: ``"ImageServer"``, ``"FeatureServer"``, ``"MapServer"``,
+    or ``"Unknown"``.
     """
-    from georest.restesri import portal as _gp
-    return _gp._detect_service_type(url, meta)
+    # Normalise
+    clean = url.rstrip("/").lower()
+
+    # Canonical spellings: match URL segment (case-insensitive), return
+    # the correctly-cased ArcGIS type name.
+    _stype_map = {
+        "imageserver": "ImageServer",
+        "featureserver": "FeatureServer",
+        "mapserver": "MapServer",
+    }
+    for lower, canonical in _stype_map.items():
+        if f"/{lower}" in clean or clean.endswith(lower):
+            return canonical
+
+    # Fall back to metadata inspection
+    if meta is None:
+        try:
+            meta = getServiceMetadata(url)
+        except Exception:
+            return "Unknown"
+
+    # ArcGIS REST items carry a "type" key on the item record,
+    # but service endpoint JSON uses serviceDataType or serviceType.
+    for key in ("serviceDataType", "serviceType", "type"):
+        val = meta.get(key, "")
+        if isinstance(val, str):
+            v = val.lower()
+            if "image" in v:
+                return "ImageServer"
+            if "feature" in v:
+                return "FeatureServer"
+            if "map" in v:
+                return "MapServer"
+
+    # Check for fields[] → likely a FeatureServer layer
+    if "fields" in meta:
+        return "FeatureServer"
+    # Check for bandCount → ImageServer
+    if "bandCount" in meta or "pixelType" in meta:
+        return "ImageServer"
+
+    return "Unknown"
+
 
 def _resolve_url(url_or_result: str | dict) -> str:
-    """A service URL from a string or a ``searchPortal`` result. Delegates.
+    """Extract a service URL from either a raw URL string or a
+    :func:`searchPortal` result dict."""
+    if isinstance(url_or_result, str):
+        return url_or_result.rstrip("/")
+    if isinstance(url_or_result, dict):
+        # searchPortal result has a "url" key; fall back to id-based lookup
+        service_url = url_or_result.get("url", "")
+        if service_url:
+            return service_url.rstrip("/")
+        raise ValueError(
+            "Portal result dict has no 'url' key.  Either the item is not a "
+            "hosted service, or the portal did not return a URL for it.  "
+            "Check url_or_result['_raw'] for the full item record."
+        )
+    raise TypeError(
+        f"url_or_result must be a URL string or a searchPortal() result dict, "
+        f"got {type(url_or_result).__name__!r}"
+    )
 
-    Another byte-identical copy, raising the same ``TypeError`` for a
-    non-string/dict and ``ValueError`` for a result with no ``url``.
-    """
-    from georest.restesri import portal as _gp
-    return _gp._resolve_url(url_or_result)
+
+# ---------------------------------------------------------------------------
+# addEsriImageService
+# ---------------------------------------------------------------------------
 
 def addEsriImageService(
     url_or_result: str | dict,
@@ -465,12 +535,11 @@ def addEsriImageService(
     if name is None:
         name = url.rstrip("/").split("/")[-2] if url.endswith(("ImageServer", "imageserver")) else url.rstrip("/").split("/")[-1]
 
-    # The {z}/{y}/{x} template -- ArcGIS order, y before x, not the XYZ
-    # standard -- and the token quoting are georest's. The body here was
-    # identical to it line for line, which is the kind of copy that gets
-    # a fix in one place and not the other.
-    from georest.restesri import services as _gs
-    tile_url = _gs.getImageServiceTileUrl(url, token=token)
+    # ArcGIS Image/Map Server tile endpoint: /tile/{z}/{y}/{x}
+    # Note: ArcGIS uses y then x (not the XYZ standard x then y).
+    tile_url = f"{url}/tile/{{z}}/{{y}}/{{x}}"
+    if token:
+        tile_url = f"{tile_url}?token={urllib.parse.quote(token, safe='')}"
 
     kw: dict[str, Any] = {}
     if viz_params:
@@ -568,6 +637,211 @@ def addEsriMapService(
 
 _FEATURE_QUERY_SUFFIX = "/query"
 
+# ---------------------------------------------------------------------------
+# LOCAL PATCH esri paging v1 (2026-09-21)
+# ---------------------------------------------------------------------------
+#: Hard stop on the paging loop. 200 pages at a 2,000 maxRecordCount is
+#: 400,000 features - far past anything this viewer can draw, so reaching it
+#: means the server is misbehaving and the loop must not run forever.
+_MAX_PAGES = 200
+
+#: LOCAL PATCH esri paging v2 (2026-09-21): how many pages of one
+#: layer to fetch at the same time. Four, not more: the gain is in
+#: not waiting on round trips, and hazards.fema.gov already resets
+#: about a third of our handshakes without being crowded.
+_PAGE_WORKERS = 4
+
+
+def _exceeded_transfer(payload: dict) -> bool:
+    """True when ArcGIS says it withheld rows.
+
+    The flag sits at the top level of a GeoJSON response and under
+    ``properties`` in the Esri JSON one. Both shapes reach here, because
+    ``f=geojson`` is not honoured by every service version.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("exceededTransferLimit"):
+        return True
+    props = payload.get("properties")
+    return bool(isinstance(props, dict) and props.get("exceededTransferLimit"))
+
+
+#: LOCAL PATCH esri paging v3 (2026-09-21): one layer's metadata, fetched once.
+#: A classed source draws one sub-layer per class - six, for FEMA flood
+#: zones - and every one of them was asking the SAME layer the same
+#: question. Keyed on the URL and whether a token was used, never on the
+#: token itself.
+_CAPS_CACHE: dict = {}
+
+
+def _paging_caps(layer_url: str, token: str | None) -> dict:
+    """``{"paginates", "orders", "oid", "max_record"}`` for a layer.
+
+    ``objectIdField`` is present on FeatureServer layers and often absent on
+    MapServer ones, so the OID field is also looked for by TYPE. Without an
+    OID neither paging strategy is safe and the caller reports partial.
+
+    ``max_record`` is the server's own page size, which lets the caller skip
+    a fetch it would only discard - see LOCAL PATCH esri paging v3 (2026-09-21).
+    """
+    cache_key = (layer_url, bool(token))
+    if cache_key in _CAPS_CACHE:
+        return _CAPS_CACHE[cache_key]
+    caps = {"paginates": False, "orders": True, "oid": None,
+            "max_record": None}
+    try:
+        meta = _fetch_json(layer_url, _build_params({"f": "json"}, token))
+    except Exception:                                    # noqa: BLE001
+        return caps
+    if not isinstance(meta, dict) or "error" in meta:
+        return caps
+    adv = meta.get("advancedQueryCapabilities") or {}
+    caps["paginates"] = bool(adv.get("supportsPagination"))
+    caps["orders"] = bool(adv.get("supportsOrderBy", True))
+    oid = meta.get("objectIdField")
+    if not oid:
+        for field in meta.get("fields") or []:
+            if (field or {}).get("type") == "esriFieldTypeOID":
+                oid = field.get("name")
+                break
+    caps["oid"] = oid
+    try:
+        caps["max_record"] = int(meta.get("maxRecordCount") or 0) or None
+    except (TypeError, ValueError):
+        caps["max_record"] = None
+    _CAPS_CACHE[cache_key] = caps
+    return caps
+
+
+def _feature_id(feat: dict, oid: str | None):
+    """A feature's stable identity, or None when it has none.
+
+    GeoJSON from ArcGIS carries the OID as ``id``; when ``outFields`` brought
+    the field back it is in ``properties`` too. Either will do - what matters
+    is that repeated rows can be recognised, because a server that ignores
+    the paging parameters answers every page identically.
+    """
+    fid = feat.get("id")
+    if fid is None and oid:
+        fid = (feat.get("properties") or {}).get(oid)
+    return fid
+
+
+def _page_features(query_url: str, params: dict, matched: int,
+                   layer_url: str, token: str | None, first_page: list) -> list:
+    """Every feature the query matches, or as many as can be paged safely.
+
+    Returns ``first_page`` unchanged when no safe strategy exists - the
+    caller then names the layer as partial rather than drawing a slice that
+    looks whole.
+    """
+    caps = _paging_caps(layer_url, token)
+    oid = caps["oid"]
+    if not oid or not caps["orders"]:
+        return first_page
+    strategy = "offset" if caps["paginates"] else "oid_window"
+
+    # The first page was fetched with NO orderByFields, so its row order is
+    # whatever the server felt like. Offsetting into a different order skips
+    # and repeats rows, so that page is thrown away and paging restarts at 0
+    # under an explicit ORDER BY. One wasted request buys a correct layer.
+    base_where = params.get("where") or "1=1"
+    features: list = []
+    seen: set = set()
+    last = None
+
+    def _harvest(rows) -> int:
+        """Add the rows that are new. Returns how many, or -1 when the rows
+        carry no identity - a server ignoring the paging parameters cannot
+        be told from one honouring them, so that case must stop the loop
+        rather than collect duplicates as if complete."""
+        nonlocal last
+        added = 0
+        for feat in rows:
+            fid = _feature_id(feat, oid)
+            if fid is None:
+                return -1
+            if fid in seen:
+                continue
+            seen.add(fid)
+            last = fid
+            features.append(feat)
+            added += 1
+        return added
+
+    def _page(extra: dict):
+        page = dict(params)
+        page["orderByFields"] = oid
+        page.update(extra)
+        try:
+            got = _fetch_json(query_url, page)
+        except Exception:                                # noqa: BLE001
+            return None
+        if not isinstance(got, dict) or "error" in got:
+            return None
+        return got.get("features") or []
+
+    # LOCAL PATCH esri paging v2 (2026-09-21): the pages are independent
+    # under offset paging, and waiting for each in turn was the whole cost -
+    # measured over the Houston urban area, 16 geometry pages took 62.9 s of
+    # a 71.5 s draw, about 4 s per request whatever its size. Once the first
+    # page has shown how big a page is, the remaining offsets are arithmetic
+    # and can be fetched at the same time. Four at a time: the point is to
+    # stop waiting on round trips, not to hammer a federal server that
+    # already resets about a third of our handshakes.
+    # The first page carries `resultOffset` only under offset paging. A
+    # layer without `supportsPagination` IGNORES the parameter, and sending
+    # it there would hide that fact from anyone reading the requests.
+    rows = _page({"resultOffset": "0"} if strategy == "offset" else {})
+    if not rows:
+        return first_page
+    page_size = len(rows)
+    if _harvest(rows) < 0:
+        return features or first_page
+
+    if strategy == "offset" and page_size and len(features) < matched:
+        offsets = list(range(page_size, min(matched, page_size * _MAX_PAGES),
+                             page_size))
+        if offsets:
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=_PAGE_WORKERS) as pool:
+                    for got in pool.map(
+                            lambda off: _page({"resultOffset": str(off)}),
+                            offsets):
+                        if not got:
+                            continue
+                        if _harvest(got) < 0:
+                            break
+            except Exception:                            # noqa: BLE001
+                # Threads unavailable or the pool blew up: fall through to
+                # the sequential loop below, which finishes the job slowly
+                # rather than returning a layer that looks whole.
+                pass
+
+    # Sequential finish. It completes an OID-window layer, and it also picks
+    # up anything the parallel pass missed - a page that failed every retry
+    # leaves a hole, and a hole is exactly what must not be drawn as whole.
+    for _ in range(_MAX_PAGES):
+        if len(features) >= matched:
+            break
+        if strategy == "offset":
+            extra = {"resultOffset": str(len(features))}
+        elif last is not None:
+            extra = {"where": f"({base_where}) AND {oid} > {last}"}
+        else:
+            extra = {}
+        rows = _page(extra)
+        if not rows:
+            break
+        added = _harvest(rows)
+        if added <= 0:
+            break
+    # Paging that went backwards is a bug, not an improvement.
+    return features if len(features) >= len(first_page) else first_page
+
+
 
 def addEsriFeatureService(
     url_or_result: str | dict,
@@ -577,6 +851,20 @@ def addEsriFeatureService(
     where: str = "1=1",
     bbox: str | None = None,
     token: str | None = None,
+    # LOCAL PATCH esri generalise v1 (2026-09-17): server-side geometry
+    # thinning, in the units of outSR. None keeps every vertex.
+    max_allowable_offset: float | None = None,
+    # LOCAL PATCH readable popup v1 (2026-09-21): which fields to fetch, and
+    # the words to show them under. None keeps outFields="*" and the
+    # service's own field names, which is what every earlier caller
+    # gets. A 469-field layer makes an unreadable popup otherwise.
+    out_fields: str | None = None,
+    field_labels: dict | None = None,
+    # LOCAL PATCH layer visible v1 (2026-09-21): added to the map switched
+    # off. Three stacked translucent polygon layers is a brown wash in
+    # which none of them can be read; the layer still has to BE there,
+    # so it is added and left for the viewer to switch on.
+    visible: bool = True,
     target_map=None
 ) -> None:
     """Fetch and add an ArcGIS Feature Service layer as a GeoJSON vector layer.
@@ -650,66 +938,324 @@ def addEsriFeatureService(
             parts = url.rstrip("/").split("/")
             name = f"{parts[-2]} ({name})" if len(parts) >= 2 else name
 
-    # ---- count pre-flight + GeoJSON fetch, both georest's ----------
-    #
-    # queryFeatureService does exactly what the ~70 lines here used to:
-    # a returnCountOnly pre-flight that honors the SAME spatial filter
-    # as the fetch (so max_features guards the area asked about rather
-    # than the whole layer -- FEMA NFHL is 5.8M features nationally and
-    # 52 in a 2 km box), the overflow guard, then outSR=4326 GeoJSON.
-    #
-    # `bbox` stays the parameter name here because it is this module's
-    # published signature; georest spells the same thing as a geometry
-    # plus its type, and an envelope intersect is its default.
-    from georest.restesri import services as _gs
+    # ---- Pre-flight: count only ----
+    count_params: dict[str, Any] = {
+        "where": where,
+        "returnCountOnly": "true",
+        "f": "json",
+    }
+    # LOCAL PATCH (2026-08-28): area filter. Applied to the COUNT as well as
+    # the fetch, so max_features guards the area asked about rather than the
+    # whole layer - FEMA NFHL is 5.8M features nationally, 52 in a 2 km box.
+    _bbox_params = {}
+    if bbox:
+        _bbox_params = {
+            "geometry": bbox,
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+        }
+        count_params.update(_bbox_params)
+    if token:
+        count_params["token"] = token
 
-    # geeViz's SSRF guard, which georest does not have and should not:
-    # it is this package's policy, not a REST client's. It used to be
-    # reached through _fetch_json; calling georest directly skips that
-    # path, so it has to be applied here or delegation quietly removes
-    # a security check.
-    _check_url(url)
-
+    count_url = f"{url}{_FEATURE_QUERY_SUFFIX}"
     try:
-        geojson = _gs.queryFeatureService(
-            url,
-            where=where,
-            geometry=bbox,
-            max_features=max_features,
-            token=token,
-        )
-    except ValueError:
-        # An Esri error body, or the overflow guard. Both mean the same
-        # on either side of the boundary -- pass them through rather
-        # than flattening them into the network case.
-        raise
-    except RuntimeError as exc:
-        # georest reports an unreachable host or a bad HTTP status as
-        # RuntimeError. This module has always raised ConnectionError
-        # and its callers catch that, so translate at the boundary --
-        # the same thing _fetch_json does, for the same reason.
-        raise ConnectionError(
-            f"Could not reach Feature Service at {url!r}: {exc}"
-        ) from exc
+        count_resp = _fetch_json(count_url, count_params)
     except urllib.error.URLError as exc:
         raise ConnectionError(
-            f"Could not reach Feature Service at {url!r}: {exc}"
+            f"Could not reach Feature Service at {count_url!r}: {exc}"
         ) from exc
 
-    actual = len(geojson.get("features", []))
-    print(f"Adding Esri Feature Service: {name} ({actual:,} features)")
+    # Esri may return {"count": N} or {"error": {...}}
+    if "error" in count_resp:
+        err = count_resp["error"]
+        raise ValueError(
+            f"Feature Service returned an error: "
+            f"{err.get('code')} — {err.get('message', str(err))}"
+        )
+
+    feature_count = count_resp.get("count", 0)
+
+    if feature_count > max_features:
+        raise ValueError(
+            f"Feature service has {feature_count:,} features "
+            f"(max_features={max_features:,}).\n"
+            f"Increase max_features OR pass a `where` clause to filter, "
+            f"e.g. where=\"STATE_FIPS='06'\", "
+            f"OR set chunk_size= to paginate (future extension)."
+        )
+
+    # ---- Fetch GeoJSON ----
+    query_params: dict[str, Any] = {
+        "where": where,
+        # LOCAL PATCH readable popup v1 (2026-09-21)
+        "outFields": out_fields or "*",
+        "outSR": "4326",           # always WGS84 so the viewer renders it natively
+        "f": "geojson",
+    }
+    query_params.update(_bbox_params)
+    # LOCAL PATCH esri generalise v1 (2026-09-17): only when asked. The
+    # count query above is deliberately left alone - it returns no
+    # geometry, so there is nothing to thin.
+    if max_allowable_offset:
+        query_params["maxAllowableOffset"] = str(max_allowable_offset)
+    if token:
+        query_params["token"] = token
+
+    # LOCAL PATCH esri paging v3 (2026-09-21): when the count already exceeds
+    # the server's own page size, this fetch returns one page that the
+    # paging below immediately discards - it is unordered, so offsetting
+    # into it would skip and repeat rows. Measured: two of every five round
+    # trips a classed city-scale draw made were this and the metadata
+    # lookup. Skipping it is safe only when the layer HAS said what its
+    # page size is and can be paged; otherwise the original path runs.
+    _caps = _paging_caps(url, token)
+    _skip_first = bool(
+        _caps.get("max_record") and feature_count > _caps["max_record"]
+        and _caps.get("oid") and _caps.get("orders"))
+    if _skip_first:
+        # `exceededTransferLimit` is the honest description of what this
+        # stands in for: the whole layer is known not to fit in one
+        # response, which is exactly what the flag means.
+        geojson = {"type": "FeatureCollection", "features": [],
+                   "exceededTransferLimit": True}
+    else:
+        try:
+            geojson = _fetch_json(count_url, query_params)
+        except urllib.error.URLError as exc:
+            raise ConnectionError(
+                f"Could not fetch features from {count_url!r}: {exc}"
+            ) from exc
+
+    if "error" in geojson:
+        err = geojson["error"]
+        raise ValueError(
+            f"Feature Service query returned an error: "
+            f"{err.get('code')} — {err.get('message', str(err))}"
+        )
+
+    # LOCAL PATCH esri paging v1 (2026-09-21): ArcGIS caps ONE response at the
+    # layer's maxRecordCount (2,000 on every service this project maps),
+    # and this drew whatever came back. Measured on the shipped statewide
+    # fault draw: 10,245 matched, 2,000 drawn, exceededTransferLimit true
+    # in the response and nothing reading it. Page, and when paging still
+    # cannot finish, put the shortfall in the LAYER NAME - the legend is
+    # where a person at the booth would see it, not the console.
+    features = geojson.get("features") or []
+    if _exceeded_transfer(geojson) or 0 < len(features) < feature_count:
+        features = _page_features(count_url, query_params, feature_count,
+                                  url, token, features)
+        geojson["features"] = features
+
+    actual = len(features)
+    if actual < feature_count:
+        name = f"{name} - {actual:,} of {feature_count:,} drawn"
+        print(f"Adding Esri Feature Service: {name} (PARTIAL - the "
+              f"service would not return the rest)")
+    else:
+        print(f"Adding Esri Feature Service: {name} ({actual:,} features)")
+
+    # LOCAL PATCH readable popup v1 (2026-09-21): the viewer's popup prints
+    # property NAMES, so renaming them here is the only way a click
+    # can say "Hurricane" rather than "HRCN_RISKR". Applied in the
+    # order given, so the field that matters reaches the top of the
+    # popup; anything unlabelled keeps its name and follows.
+    if field_labels:
+        for feature in geojson.get("features") or []:
+            props = feature.get("properties")
+            if not isinstance(props, dict):
+                continue
+            renamed = {}
+            for field, label in field_labels.items():
+                if field in props:
+                    renamed[label] = props.pop(field)
+            renamed.update(props)
+            feature["properties"] = renamed
 
     viz = dict(viz_params or {})
     # The viewer needs layerType=geoJSONVector; addLayer sets it automatically
     # when passed a dict, but be explicit so callers can mix it with other keys.
     viz.setdefault("layerType", "geoJSONVector")
 
-    (target_map or gv.Map).addLayer(geojson, viz, name)
+    # LOCAL PATCH layer visible v1 (2026-09-21)
+    (target_map or gv.Map).addLayer(geojson, viz, name, visible)
 
 
 # ---------------------------------------------------------------------------
 # addEsriService — auto-dispatch
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# LOCAL PATCH classed fetch v1 (2026-09-21)
+# ---------------------------------------------------------------------------
+def _class_row_matches(props: dict, match: dict) -> bool:
+    """Does one feature satisfy one class spec?
+
+    Mirrors `agent_tools._row_matches`. The NULL rules are the whole reason
+    this is written out rather than done with a set membership test: FEMA
+    encodes the regulatory floodway as a SUBTYPE of Zone AE, so an ordinary
+    AE polygon carries ZONE_SUBTY NULL and IS the row that the "everything
+    except the floodway" class has to keep.
+    """
+    for field, rule in (match or {}).items():
+        value = props.get(field)
+        text = None if value is None else str(value)
+        wanted = rule.get("in") if isinstance(rule, dict) else rule
+        unwanted = rule.get("not_in") if isinstance(rule, dict) else None
+        if unwanted is not None:
+            if text is None:
+                if None in unwanted or "null" in [str(u).lower()
+                                                  for u in unwanted]:
+                    return False
+            elif text in [str(u) for u in unwanted]:
+                return False
+        if wanted is not None:
+            allow_null = any(w is None for w in wanted)
+            if text is None:
+                if not allow_null:
+                    return False
+            elif text not in [str(w) for w in wanted if w is not None]:
+                return False
+    return True
+
+
+def addEsriFeatureServiceClassed(
+    url: str,
+    classes: list,
+    bbox: str | None = None,
+    where: str = "1=1",
+    other: dict | None = None,
+    out_fields: str | None = None,
+    field_labels: dict | None = None,
+    max_allowable_offset: float | None = None,
+    max_features: int = 1000,
+    token: str | None = None,
+    target_map=None,
+) -> None:
+    """Fetch a layer ONCE and add one map layer per class.
+
+    Every class asks the same layer over the same box, so asking six times
+    is six count preflights, six metadata lookups and six paging runs.
+    Measured over the Houston urban area: 79.0 s that way, 27.7 s this way,
+    the same features either way.
+
+    Args:
+        classes: ``[{"name", "viz", "match", "visible"}]``. `match` is the
+            JSON form described in the patch docstring.
+        other: optional ``{"name", "viz", "visible"}`` for rows matching no
+            class. Without it those rows are DROPPED and the count is
+            reported, because a class we have not modelled must never
+            vanish in silence.
+        where: the outer filter - typically the source's exclude clause.
+    """
+    import geeViz.geeView as gv
+
+    url = _resolve_url(url)
+    if url.lower().endswith("featureserver"):
+        url = f"{url}/0"
+
+    count_params: dict[str, Any] = {"where": where, "returnCountOnly": "true",
+                                    "f": "json"}
+    bbox_params: dict[str, Any] = {}
+    if bbox:
+        bbox_params = {"geometry": bbox, "geometryType": "esriGeometryEnvelope",
+                       "inSR": "4326", "spatialRel": "esriSpatialRelIntersects"}
+        count_params.update(bbox_params)
+    if token:
+        count_params["token"] = token
+
+    query_url = f"{url}{_FEATURE_QUERY_SUFFIX}"
+    count_resp = _fetch_json(query_url, count_params)
+    if "error" in count_resp:
+        err = count_resp["error"]
+        raise ValueError(f"Feature Service returned an error: "
+                         f"{err.get('code')} - {err.get('message', str(err))}")
+    matched = count_resp.get("count", 0)
+    if matched > max_features:
+        raise ValueError(
+            f"Feature service has {matched:,} features "
+            f"(max_features={max_features:,}). Increase max_features OR "
+            f"narrow `where`.")
+
+    query_params: dict[str, Any] = {
+        "where": where, "outFields": out_fields or "*", "outSR": "4326",
+        "f": "geojson"}
+    query_params.update(bbox_params)
+    if max_allowable_offset:
+        query_params["maxAllowableOffset"] = str(max_allowable_offset)
+    if token:
+        query_params["token"] = token
+
+    caps = _paging_caps(url, token)
+    if (caps.get("max_record") and matched > caps["max_record"]
+            and caps.get("oid") and caps.get("orders")):
+        features = _page_features(query_url, query_params, matched, url,
+                                  token, [])
+    else:
+        payload = _fetch_json(query_url, query_params)
+        if "error" in payload:
+            err = payload["error"]
+            raise ValueError(f"Feature Service query returned an error: "
+                             f"{err.get('code')} - {err.get('message')}")
+        features = payload.get("features") or []
+        if _exceeded_transfer(payload) or 0 < len(features) < matched:
+            features = _page_features(query_url, query_params, matched, url,
+                                      token, features)
+
+    if field_labels:
+        for feature in features:
+            props = feature.get("properties")
+            if not isinstance(props, dict):
+                continue
+            renamed = {}
+            for field, label in field_labels.items():
+                if field in props:
+                    renamed[label] = props.pop(field)
+            renamed.update(props)
+            feature["properties"] = renamed
+
+    # Split. One pass, first matching class wins, exactly as the per-class
+    # SQL did - the classes are written to be disjoint and the floodway
+    # deliberately sits last so it beats the AE it is inside.
+    buckets = [[] for _ in classes]
+    leftovers = []
+    for feature in features:
+        props = feature.get("properties") or {}
+        for index, spec in enumerate(classes):
+            if _class_row_matches(props, spec.get("match") or {}):
+                buckets[index].append(feature)
+                break
+        else:
+            leftovers.append(feature)
+
+    short = len(features) < matched
+    for spec, rows in zip(classes, buckets):
+        name = spec.get("name") or "layer"
+        if short:
+            name = f"{name} - {len(features):,} of {matched:,} drawn"
+        viz = dict(spec.get("viz") or {})
+        viz.setdefault("layerType", "geoJSONVector")
+        print(f"Adding Esri Feature Service: {name} ({len(rows):,} features)")
+        (target_map or gv.Map).addLayer(
+            {"type": "FeatureCollection", "features": rows}, viz, name,
+            bool(spec.get("visible", True)))
+
+    if leftovers:
+        if other:
+            viz = dict(other.get("viz") or {})
+            viz.setdefault("layerType", "geoJSONVector")
+            name = other.get("name") or "Other classes"
+            print(f"Adding Esri Feature Service: {name} "
+                  f"({len(leftovers):,} features)")
+            (target_map or gv.Map).addLayer(
+                {"type": "FeatureCollection", "features": leftovers}, viz,
+                name, bool(other.get("visible", True)))
+        else:
+            print(f"WARNING: {len(leftovers):,} features matched no class and "
+                  f"were NOT drawn - pass `other=` to keep them.")
+
 
 def addEsriService(
     url_or_result: str | dict,
