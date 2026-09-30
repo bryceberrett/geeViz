@@ -143,6 +143,24 @@ from geeViz._ssrf import check_url as _check_url  # noqa: E402
 #: dict. Aliasing keeps one source of truth and makes an edit
 #: through either name work.
 from georest.restesri.portal import PORTALS  # noqa: E402
+
+# LOCAL PATCH georest fallback v1 (2026-09-30): georest 0.3.0's
+# queryFeatureService, when its f=geojson request fails, re-asks in f=json
+# and converts client-side with services._esri_geometry_to_geojson - which
+# hands Esri's flat ring list straight to one GeoJSON Polygon, so the
+# separate parts of a multipart polygon become HOLES in its first part, and
+# services._sanitize_geojson overwrites every feature id with "0".."n". The
+# same package already has the right versions in edw.py (winding-aware
+# rings, ids filled from OBJECTID and never overwritten). Point the fallback
+# at those. Remove when georest's services.py uses them itself (reported to
+# Ryan). A FEMA handshake reset is enough to take this path.
+try:
+    from georest.restesri import edw as _gr_edw, services as _gr_services
+    if hasattr(_gr_edw, "_esri_rings_to_geojson"):
+        _gr_services._esri_geometry_to_geojson = _gr_edw._esri_geometry_to_geojson
+        _gr_services._sanitize_geojson = _gr_edw._sanitize_geojson
+except ImportError:                              # pragma: no cover
+    pass
 """Module-level dict mapping short names to portal base URLs.
 
 Add your own at runtime::
