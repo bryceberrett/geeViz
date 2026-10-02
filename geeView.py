@@ -2255,14 +2255,17 @@ class mapper:
         with open(template, "r", encoding="utf-8") as f:
             html = f.read()
 
-        # LOCAL PATCH (2026-09-03): the template hard-codes geeViz's own
-        # Google Maps key, which is HTTP-referrer-restricted to geeViz's
-        # domains (plus localhost - which is why every local test passes
-        # and every OTHER deployment fails with RefererNotAllowedMapError,
-        # a blank grey map, and a console pointing at a key the deployer
-        # does not own). If the standard env var names a key, stamp it
-        # into the page instead; otherwise behave exactly as before.
-        _maps_key = os.environ.get("GOOGLE_MAPS_PLATFORM_API_KEY", "").strip()
+        # LOCAL PATCH (2026-09-03) + maps key v2 (2026-10-02): the template
+        # hard-codes geeViz's own Google Maps key, which is HTTP-referrer-
+        # restricted to the domains Ian allows - the right key for a
+        # browser. v1 stamped GOOGLE_MAPS_PLATFORM_API_KEY over it, and
+        # that variable is the SERVER key the agent sends to the Maps
+        # Platform MCP (Places, Weather) - so every exported map published
+        # a server key in its HTML (Ian, 2026-10-02; keys rotated). Now only
+        # a key meant for browsers may replace it: GEEVIZ_MAPS_BROWSER_KEY,
+        # which must be referrer-restricted. Unset -> geeViz's key, and the
+        # deployment's domain must be on that key's allowed referrers.
+        _maps_key = os.environ.get("GEEVIZ_MAPS_BROWSER_KEY", "").strip()
         if _maps_key:
             import re as _re_key  # self-contained: geeView has no module-level re
             html = _re_key.sub(
