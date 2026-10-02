@@ -359,6 +359,120 @@ def serviceAccountToken(service_key_file_path):
 
 _RUNNING_SERVERS = {}  # port -> (server, thread)
 import threading as _threading
+
+
+#: Largest exported map page, in bytes. Not arbitrary: a hosted map is
+#: served through Cloud Run, which refuses a response over 32 MiB, and the
+#: agent drops any artifact over 64 MiB. A page over either never reaches
+#: the browser -- and before this guard, nothing told the model, so it
+#: reported a map the user never saw. Override per call with
+#: ``export_html(max_bytes=...)`` or process-wide with GEEVIZ_EXPORT_MAX_MB.
+_EXPORT_MAX_BYTES_DEFAULT = 25 * 1024 * 1024
+
+
+def _export_max_bytes(explicit=None) -> int:
+    """Resolve the export size limit: explicit arg, then env, then default.
+
+    ``0`` (from either source) disables the guard.
+    """
+    if explicit is not None:
+        return int(explicit)
+    env = os.environ.get("GEEVIZ_EXPORT_MAX_MB", "").strip()
+    if env:
+        try:
+            return int(float(env) * 1024 * 1024)
+        except ValueError:
+            pass
+    return _EXPORT_MAX_BYTES_DEFAULT
+
+
+#: The visualization keys Earth Engine's getMapId understands. Everything
+#: else in a geeView viz dict (layerType, autoViz, legends...) is for the
+#: viewer.
+_EE_VIZ_KEYS = ("bands", "min", "max", "gain", "bias", "gamma", "palette",
+                "opacity", "format")
+
+
+def _ee_viz_params(viz: dict) -> dict:
+    """The subset of a geeView viz dict to hand Earth Engine's getMapId.
+
+    ``opacity`` needs care. In geeView it is where the layer's slider
+    starts -- the viewer applies it client-side and never sends it to
+    Earth Engine -- so 0 is a legitimate choice ("start hidden"). Earth
+    Engine's own opacity must be in (0, 1], and forwarding a 0 made the
+    validator report a layer that renders fine as an error:
+    ``Image.visualize: Scale must be greater than zero``. An agent then
+    deleted a working wind layer on the strength of that report. Only an
+    opacity Earth Engine accepts is forwarded; the viewer still gets the
+    caller's value, untouched, through the viz dict itself.
+    """
+    out = {k: viz[k] for k in _EE_VIZ_KEYS if k in viz}
+    if "opacity" in out:
+        try:
+            ok = 0 < float(out["opacity"]) <= 1
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            del out["opacity"]
+    return out
+
+
+#: viz keys that only the wind renderer reads (see addWindLayer).
+_WIND_ONLY_VIZ_KEYS = ("windSpeedOpacity", "directionConvention")
+
+
+def _is_wind_timelapse_viz(viz: dict) -> bool:
+    """Whether an ``addTimeLapse`` viz was really meant for ``addWindTimeLapse``.
+
+    Handed a wind collection with ``{"units": "kt", "particleDensity": 1.5}``,
+    plain ``addTimeLapse`` raises nothing: it labels frames ``"YYYY"``,
+    collapses a sub-daily forecast into one mosaic, and draws raw u/v with
+    no stretch, so the map shows only the basemap. Those keys mean nothing
+    outside the wind renderer, so their presence is the signal.
+
+    The wind helpers call ``addTimeLapse`` themselves with the internal
+    ``windParticles`` marker; those calls are never routed, or they would
+    recurse.
+    """
+    if not viz or viz.get("windParticles"):
+        return False
+    if any(str(k).startswith("particle") for k in viz):
+        return True
+    if any(k in viz for k in _WIND_ONLY_VIZ_KEYS):
+        return True
+    if "units" in viz:
+        # Lazy: geeViz.weather pulls in fireLib, and geeView is imported
+        # by everything.
+        from geeViz.weather import _speed_units
+        try:
+            _speed_units(viz["units"])
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _js_str(value) -> str:
+    """A JavaScript string literal for arbitrary text, safe anywhere in the
+    generated viewer script.
+
+    Layer names, the map title and query settings come from users and from
+    agents, and they were interpolated into JS string literals unescaped.
+    One apostrophe -- ``Peak Nor'easter Wind`` -- ended the string early,
+    the whole runGeeViz.js failed to PARSE, ``runGeeViz`` was never
+    defined, and not a single layer loaded, ordinary names included. The
+    server-side validator never runs this script, so it reported PASS.
+
+    ``json.dumps`` emits a valid JS string literal for any input: it
+    escapes both quote styles, backslashes, control characters and --
+    because ``ensure_ascii`` is on -- U+2028/U+2029, which JSON allows raw
+    but older JS engines treat as line terminators. ``</`` becomes
+    ``<\\/`` (the same string to JS) so the text stays inert even when the
+    script is inlined into an HTML ``<script>`` element, where the HTML
+    parser closes the element at the first ``</script`` regardless of any
+    JS quoting.
+    """
+    return json.dumps("" if value is None else str(value)).replace("</", "<\\/")
 # Reentrant lock so `run_local_server` can call `_kill_server` (which also
 # acquires this lock) while holding it — a non-reentrant `Lock()` would
 # deadlock and hang `Map.view()` any time a stale state file is found.
@@ -1567,13 +1681,14 @@ class mapper:
         # LOCAL PATCH (2026-08-28): pass self, or the layer lands on gv.Map.
         return _el.addEsriImageService(url_or_result, viz_params=viz_params, name=name, token=token, target_map=self)
 
-    def addEsriMapService(self, url_or_result, name=None, token=None, viz_params=None):
+    def addEsriMapService(self, url_or_result, name=None, token=None, viz_params=None,
+                          visible=None):
         """See ``geeViz.esriLib.addEsriMapService``. Delegates. If the
         service is dynamic (non-cached), esriLib now falls back to
         ``Map.addDynamicMapService`` internally instead of raising."""
         from geeViz import esriLib as _el
         # LOCAL PATCH (2026-08-28): pass self, or the layer lands on gv.Map.
-        return _el.addEsriMapService(url_or_result, name=name, token=token, viz_params=viz_params, target_map=self)
+        return _el.addEsriMapService(url_or_result, name=name, token=token, viz_params=viz_params, target_map=self, visible=visible)
 
     def addEsriFeatureService(self, url_or_result, viz_params=None, name=None,
                               max_features=1000, where="1=1", token=None,
@@ -1586,7 +1701,8 @@ class mapper:
                               # LOCAL PATCH readable popup v1 (2026-09-21)
                               out_fields=None, field_labels=None,
                               # LOCAL PATCH layer visible v1 (2026-09-21)
-                              visible=True):
+                              visible=True,
+                              simplify="auto", max_layer_mb=None):
         """See ``geeViz.esriLib.addEsriFeatureService``. Delegates."""
         from geeViz import esriLib as _el
         # LOCAL PATCH (2026-08-28): pass self, or the layer lands on gv.Map.
@@ -1596,7 +1712,8 @@ class mapper:
                                           max_allowable_offset=max_allowable_offset,
                                           out_fields=out_fields,
                                           field_labels=field_labels,
-                                          visible=visible)
+                                          visible=visible,
+                                          simplify=simplify, max_layer_mb=max_layer_mb)
 
     def addEsriFeatureServiceClassed(self, url, classes, bbox=None,
                                      where="1=1", other=None,
@@ -1613,14 +1730,15 @@ class mapper:
             max_features=max_features, token=token, target_map=self)
 
     def addEsriService(self, url_or_result, viz_params=None, name=None, token=None,
-                       max_features=1000, where="1=1"):
+                       max_features=1000, where="1=1", bbox=None, simplify="auto"):
         """See ``geeViz.esriLib.addEsriService``. Auto-detects the
         service type from URL / metadata and delegates to the right
         add-helper."""
         from geeViz import esriLib as _el
         # LOCAL PATCH (2026-08-28): pass self, or the layer lands on gv.Map.
         return _el.addEsriService(url_or_result, viz_params=viz_params, name=name, token=token,
-                                   max_features=max_features, where=where, target_map=self)
+                                   max_features=max_features, where=where, target_map=self,
+                                   bbox=bbox, simplify=simplify)
 
     ######################################################################
     # Function for adding a layer to the map
@@ -1788,6 +1906,14 @@ class mapper:
 
 
         """
+        if _is_wind_timelapse_viz(viz):
+            print("Wind viz keys given to addTimeLapse; drawing it with addWindTimeLapse")
+            from geeViz.weather import addWindTimeLapse as _addWindTimeLapse
+            return _addWindTimeLapse(self, image, viz, name=name or "Wind", visible=visible,
+                                     dateFormat=viz.get("dateFormat"),
+                                     advanceInterval=viz.get("advanceInterval"),
+                                     mosaic=bool(viz.get("mosaic", False)))
+
         if name == None:
             name = "Layer " + str(self.layerNumber)
             self.layerNumber += 1
@@ -2044,8 +2170,7 @@ class mapper:
             except Exception:
                 pass
         if _py_default:
-            _pd_esc = _py_default.replace("\\", "\\\\").replace('"', '\\"')
-            lines += 'try{ee.data.setDefaultWorkloadTag("' + _pd_esc + '");}catch(e){}'
+            lines += "try{ee.data.setDefaultWorkloadTag(" + _js_str(_py_default) + ");}catch(e){}"
         else:
             # No Python-side default to push. Explicitly clear the JS
             # viewer's built-in ``${mode}---viewer-exports`` fallback
@@ -2081,8 +2206,7 @@ class mapper:
             # substitute one, this IS the only tagging mechanism.
             _wt = "" if _EE_API_UPSTREAM else idDict.get("workloadTag", "")
             if _wt:
-                _wt_esc = _wt.replace('\\', '\\\\').replace('"', '\\"')
-                lines += 'try{ee.data.setWorkloadTag("' + _wt_esc + '");}catch(e){}'
+                lines += "try{ee.data.setWorkloadTag(" + _js_str(_wt) + ");}catch(e){}"
             else:
                 lines += "try{ee.data.resetWorkloadTag();}catch(e){}"
             if idDict.get("_is_dynamic_esri"):
@@ -2092,43 +2216,38 @@ class mapper:
                 # method on Map, so no ``Map.`` prefix. Escapes match
                 # the addREST branch below: any backslash / double
                 # quote in the URLs is doubled for JS string safety.
-                def _jsstr(s):
-                    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
                 lines += (
-                    'try{{addDynamicToMap("{b1}","{b2}","{e1}","{e2}",'
-                    '{z1},{z2},"{name}",{visible},"","#layer-list");}}'
+                    'try{{addDynamicToMap({b1},{b2},{e1},{e2},'
+                    '{z1},{z2},{name},{visible},"","#layer-list");}}'
                     'catch(e){{layerLoadErrorMessages.push('
-                    '"Dynamic MapService \\"{name}\\" failed: "+e.message);}}'
+                    '"Dynamic MapService \\""+{name}+"\\" failed: "+e.message);}}'
                 ).format(
-                    b1=_jsstr(idDict["_dyn_base_url_1"]),
-                    b2=_jsstr(idDict["_dyn_base_url_2"]),
-                    e1=_jsstr(idDict["_dyn_ending_1"]),
-                    e2=_jsstr(idDict["_dyn_ending_2"]),
+                    b1=_js_str(idDict["_dyn_base_url_1"]),
+                    b2=_js_str(idDict["_dyn_base_url_2"]),
+                    e1=_js_str(idDict["_dyn_ending_1"]),
+                    e2=_js_str(idDict["_dyn_ending_2"]),
                     z1=int(idDict.get("_dyn_min_zoom_1", 0)),
                     z2=int(idDict.get("_dyn_min_zoom_2", 0)),
-                    name=_jsstr(idDict["name"]),
+                    name=_js_str(idDict["name"]),
                     visible=str(idDict["visible"]).lower(),
                 )
                 continue
             if idDict.get("_is_tile_url"):
                 # External XYZ tile service — emit a Map.addREST(...) call
                 # with a JS function literal that substitutes {x}/{y}/{z}.
-                # Backslash-escape any literal backslashes / double quotes in
-                # the URL so it lives safely inside a JS double-quoted string.
-                tpl = (idDict["_tile_url_template"]
-                       .replace("\\", "\\\\")
-                       .replace('"', '\\"'))
                 # LOCAL PATCH tile bbox v1 (2026-09-11): also substitute the tile's
                 # Web Mercator bounding box for {bbox}, so a WMS endpoint
                 # can stand in for a tile matrix that stops too early.
                 # minx,miny,maxx,maxy in EPSG:3857 metres (WMS 1.3.0 axis
                 # order for that CRS). Origin is the top-left of the world.
+                # _js_str (Ian) makes the URL a valid JS string literal
+                # whatever characters it holds.
                 tile_url_fn = (
                     'function(coord,zoom){'
                     'var _w=40075016.68557849,_h=_w/2,_t=_w/Math.pow(2,zoom),'
                     '_x0=-_h+coord.x*_t,_y1=_h-coord.y*_t,'
                     '_bb=[_x0,_y1-_t,_x0+_t,_y1].join(",");'
-                    'return "' + tpl + '"'
+                    'return ' + _js_str(idDict["_tile_url_template"]) +
                     '.replace("{x}",coord.x)'
                     '.replace("{y}",coord.y)'
                     '.replace("{z}",zoom)'
@@ -2146,22 +2265,22 @@ class mapper:
                 # patches/apply_tile_layer_patch.py.
                 lines += (
                     # LOCAL PATCH tile legend v2 (2026-09-02): the stored viz, so a legend reaches the page.
-                    'try{{Map.addLayer({fn},{viz},"{name}",{visible});}}'
-                    'catch(e){{layerLoadErrorMessages.push("Tile layer \\"{name}\\" failed: "+e.message);}}'
+                    'try{{Map.addLayer({fn},{viz},{name},{visible});}}'
+                    'catch(e){{layerLoadErrorMessages.push("Tile layer \\""+{name}+"\\" failed: "+e.message);}}'
                 ).format(
                     fn=tile_url_fn,
-                    name=idDict["name"].replace('"', '\\"'),
+                    name=_js_str(idDict["name"]),
                     visible=str(idDict["visible"]).lower(),
                     viz=idDict["viz"],
                 )
                 continue
 
-            lines += "{}.{}({},{},'{}',{});".format(
+            lines += "{}.{}({},{},{},{});".format(
                 idDict["objectName"],
                 idDict["function"],
                 idDict["item"],
                 idDict["viz"],
-                idDict["name"],
+                _js_str(idDict["name"]),
                 str(idDict["visible"]).lower(),
             )
         # Reset back to the current default tag (the Python one we
@@ -2182,7 +2301,12 @@ class mapper:
         )
         lines+=f"localStorage['showToolTipModal-geeViz']={str(self.showToolTipModal).lower()};"
         lines += "};"
-        return lines
+        # item/viz are JSON and already valid JS, but text inside them (a
+        # legend label, a class name) can still contain "</script". Outside
+        # of string literals the generated code never contains "</", so
+        # rewriting it everywhere only ever touches string contents, where
+        # "<\\/" is the same string.
+        return lines.replace("</", "<\\/")
 
     ######################################################################
     # Access token minting — split out of view() so any code that needs
@@ -2215,6 +2339,7 @@ class mapper:
         token_time_placeholder: str = "__GEEVIZ_TOKEN_TIME__",
         project_placeholder: str = "__GEEVIZ_PROJECT__",
         auth_proxy_placeholder: str = "__GEEVIZ_AUTH_PROXY__",
+        max_bytes: int | None = None,
     ) -> str:
         """Write a self-contained geeView HTML to `output_path`.
 
@@ -2242,9 +2367,17 @@ class mapper:
                 access-token creation time (millis epoch).
             project_placeholder (str): String to use in place of the
                 EE project ID.
+            max_bytes (int, optional): Refuse to write a page larger than
+                this. Defaults to ``GEEVIZ_EXPORT_MAX_MB`` if set, else
+                25 MB -- below what a hosted page can be served at. ``0``
+                disables the check.
 
         Returns:
             str: Absolute path to the written HTML file.
+
+        Raises:
+            ValueError: If the page would exceed ``max_bytes``. The
+                message names the heaviest layers and how to shrink them.
         """
         # Auto-enable inspector if no turnOn commands have been set.
         if not any("turnOn" in c for c in self.mapCommandList):
@@ -2255,17 +2388,20 @@ class mapper:
         with open(template, "r", encoding="utf-8") as f:
             html = f.read()
 
-        # LOCAL PATCH (2026-09-03) + maps key v2 (2026-10-02): the template
-        # hard-codes geeViz's own Google Maps key, which is HTTP-referrer-
-        # restricted to the domains Ian allows - the right key for a
-        # browser. v1 stamped GOOGLE_MAPS_PLATFORM_API_KEY over it, and
-        # that variable is the SERVER key the agent sends to the Maps
-        # Platform MCP (Places, Weather) - so every exported map published
-        # a server key in its HTML (Ian, 2026-10-02; keys rotated). Now only
-        # a key meant for browsers may replace it: GEEVIZ_MAPS_BROWSER_KEY,
-        # which must be referrer-restricted. Unset -> geeViz's key, and the
-        # deployment's domain must be on that key's allowed referrers.
-        _maps_key = os.environ.get("GEEVIZ_MAPS_BROWSER_KEY", "").strip()
+        # The template hard-codes geeViz's own Google Maps key, which is
+        # HTTP-referrer-restricted to geeViz's domains (plus localhost -
+        # which is why every local test passes and every OTHER deployment
+        # fails with RefererNotAllowedMapError and a blank grey map). A
+        # deployment supplies its own BROWSER key - referrer-restricted to
+        # its sites - in GOOGLE_MAPS_BROWSER_KEY, and it is stamped in here.
+        #
+        # Never GOOGLE_MAPS_PLATFORM_API_KEY: that is the server's key for
+        # geocoding, Places, Routes and the rest, with no referrer
+        # restriction (it is called from the server, so it cannot have
+        # one). This page is served to browsers, shared and downloaded, so
+        # anything stamped into it is public. It stamped the server key
+        # from 2026-09-11 until this was changed.
+        _maps_key = os.environ.get("GOOGLE_MAPS_BROWSER_KEY", "").strip()
         if _maps_key:
             import re as _re_key  # self-contained: geeView has no module-level re
             html = _re_key.sub(
@@ -2306,6 +2442,30 @@ class mapper:
         # Now rewrite the rest of the ./src/ asset paths
         html = html.replace('href="./src/', 'href="' + asset_base + '/src/')
         html = html.replace('src="./src/', 'src="' + asset_base + '/src/')
+
+        # Refuse a page that can never be delivered. Checked here, before
+        # the write, so an oversized map fails as an error the caller sees
+        # -- map_control returns it to the model -- instead of a file that
+        # is written, reported as a success, and silently never shown.
+        limit = _export_max_bytes(max_bytes)
+        size = len(html.encode("utf-8"))
+        if limit and size > limit:
+            heavy = sorted(
+                ((len(str(d.get("item", ""))), d.get("name", "?"))
+                 for d in self.idDictList),
+                reverse=True)[:3]
+            listing = "; ".join(f"{n!r} {b / 1e6:.1f} MB" for b, n in heavy)
+            raise ValueError(
+                f"This map would be {size / 1e6:.1f} MB, over the "
+                f"{limit / 1e6:.0f} MB a hosted map can be delivered at, so it "
+                f"would never appear. Heaviest layers: {listing}. Layers "
+                f"added as GeoJSON -- including Esri Feature Services -- carry "
+                f"every vertex inside the page. Shrink them: filter with "
+                f"where= or bbox=, request fewer features, or simplify the "
+                f"geometry before adding it. Raise the limit only if the "
+                f"page is not going to be hosted (max_bytes=, or "
+                f"GEEVIZ_EXPORT_MAX_MB)."
+            )
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
@@ -2971,7 +3131,7 @@ class mapper:
         full_path = _os.path.join(output_dir, _os.path.basename(filename))
 
         # Display-relevant viz keys (matches _test_layer)
-        _VIZ_KEYS = ("bands", "min", "max", "gain", "bias", "gamma", "palette", "opacity", "format")
+        _VIZ_KEYS = _EE_VIZ_KEYS
 
         layers = {}
         seen_names = {}      # base_name -> count assigned so far
@@ -3053,7 +3213,7 @@ class mapper:
                 continue
 
             # Build the display viz (same keys as _test_layer)
-            map_viz = {k: viz[k] for k in _VIZ_KEYS if k in viz}
+            map_viz = _ee_viz_params(viz)
 
             try:
                 styled_obj, style_mode = mapper._style_vector(ee_obj, viz)
@@ -3187,9 +3347,61 @@ class mapper:
             False
         """
         import concurrent.futures
+        import re
 
         layers = []
         futures = {}
+
+        # The extent the viewer opens on (the last centerObject). getMapId
+        # succeeds for an image that is masked everywhere -- e.g. a median of
+        # scenes the cloud mask removed entirely -- so "PASS" alone let an
+        # agent hand the user a map with nothing on it.
+        view_bounds = None
+        for cmd in reversed(getattr(self, "mapCommandList", [])):
+            m = re.match(r"synchronousCenterObject\((.+)\)", cmd)
+            if m:
+                try:
+                    coords = json.loads(m.group(1))["coordinates"][0]
+                    lngs = [c[0] for c in coords]
+                    lats = [c[1] for c in coords]
+                    view_bounds = (min(lngs), min(lats), max(lngs), max(lats))
+                except Exception:
+                    pass
+                break
+
+        def _empty_in_view_warning(img):
+            """Warning text if ``img`` has no unmasked pixel in view_bounds.
+
+            Sampled coarsely (~256 px across) and abandoned after 20 s, so a
+            heavy layer costs at most that much and never fails the test.
+            """
+            if view_bounds is None:
+                return None
+            import math
+            import threading
+            w, s, e, n = view_bounds
+            width_m = max(e - w, n - s) * 111320 * max(math.cos(math.radians((s + n) / 2)), 0.1)
+            scale = max(30, round(width_m / 256))
+            out = {}
+
+            def _run():
+                try:
+                    out["v"] = (ee.Image(img).mask().reduce(ee.Reducer.max())
+                                .reduceRegion(ee.Reducer.max(), ee.Geometry.Rectangle([w, s, e, n]),
+                                              scale, bestEffort=True, maxPixels=1e7)
+                                .values().get(0).getInfo())
+                except Exception:
+                    pass
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(20)
+            if "v" not in out or out["v"]:
+                return None
+            return (f"No visible pixels in the map's centered extent (sampled at ~{scale} m): "
+                    f"every pixel there is masked. Common causes: a cloud-masked composite with "
+                    f"no clear scenes, a date range with no images, or a threshold nothing met. "
+                    f"Check before telling the user this layer shows something.")
 
         def _test_layer(idx, idDict):
             ee_obj = idDict.get("_ee_obj")
@@ -3247,10 +3459,7 @@ class mapper:
                 # GeoJSON layers — no ee object to test
                 return {"name": name, "status": "ok", "error": None}
             # Build viz params for getMapId — only pass recognized keys
-            map_viz = {}
-            for k in ("bands", "min", "max", "gain", "bias", "gamma", "palette", "opacity", "format"):
-                if k in viz:
-                    map_viz[k] = viz[k]
+            map_viz = _ee_viz_params(viz)
             warnings = []
             try:
                 # Style vectors to match geeView viewer rendering
@@ -3281,6 +3490,11 @@ class mapper:
                 idDict["_tile_fetcher"] = map_id.get("tile_fetcher")
             except Exception as e:
                 return {"name": name, "status": "error", "error": str(e)}
+
+            if not style_mode and isinstance(test_obj, ee.Image):
+                empty = _empty_in_view_warning(test_obj)
+                if empty:
+                    warnings.append(empty)
 
             # --- autoViz validation: check class properties exist for band names ---
             # When autoViz is True, the viewer expects <bandName>_class_values,
@@ -3548,10 +3762,7 @@ class mapper:
                 layer_fetchers[name] = cached_fetcher
                 continue
             # Otherwise create a new one (with vector styling)
-            map_viz = {}
-            for k in ("bands", "min", "max", "gain", "bias", "gamma", "palette", "opacity", "format"):
-                if k in viz:
-                    map_viz[k] = viz[k]
+            map_viz = _ee_viz_params(viz)
             try:
                 test_obj, style_mode = mapper._style_vector(ee_obj, viz)
                 if style_mode == "painted":
@@ -3690,7 +3901,7 @@ class mapper:
         >>> Map.setMapTitle("<h2>A Custom Title!!!</h2>")  # Set custom map title
         >>> Map.view()
         """
-        title_command = f'Map.setTitle("{title}")'
+        title_command = f"Map.setTitle({_js_str(title)})"
         if title_command not in self.mapCommandList:
             self.mapCommandList.append(title_command)
 
@@ -3734,7 +3945,7 @@ class mapper:
         >>> Map.view()
         """
         print("Setting click query crs to: {}".format(crs))
-        cmd = f"Map.setQueryCRS('{crs}')"
+        cmd = f"Map.setQueryCRS({_js_str(crs)})"
         if cmd not in self.mapCommandList:
             self.mapCommandList.append(cmd)
 
@@ -3834,7 +4045,7 @@ class mapper:
 
         """
         print("Setting default query date format to: {}".format(defaultQueryDateFormat))
-        cmd = f'Map.setQueryDateFormat("{defaultQueryDateFormat}")'
+        cmd = f"Map.setQueryDateFormat({_js_str(defaultQueryDateFormat)})"
         if cmd not in self.mapCommandList:
             self.mapCommandList.append(cmd)
 
@@ -3854,7 +4065,7 @@ class mapper:
         >>> Map.view()
         """
         print("Setting click query box color to: {}".format(color))
-        cmd = f'Map.setQueryBoxColor("{color}")'
+        cmd = f"Map.setQueryBoxColor({_js_str(color)})"
         if cmd not in self.mapCommandList:
             self.mapCommandList.append(cmd)
 
