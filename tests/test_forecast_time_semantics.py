@@ -241,6 +241,28 @@ def test_the_window_end_is_actually_covered(model):
 
 
 @pytest.mark.parametrize("model", MODELS)
+def test_a_window_opening_now_starts_now(model):
+    """Nothing before the requested start.
+
+    "The next 72 hours", asked at 19Z, opens after the newest run began
+    (06Z). The run's part was filtered from its own start, not the
+    window's, so WeatherNext handed back 85 hourly images for 72 hours -
+    twelve already past - and a rain total summed them all
+    (LOCAL PATCH forecast window v1, 2026-10-05).
+    """
+    import geeViz.weather as wx
+    start = NOW - datetime.timedelta(hours=1)
+    d = _summary(wx.getForecastData(start, start + datetime.timedelta(
+        hours=72), model, now=NOW))
+    _real(d, model)
+    first = datetime.datetime.fromtimestamp(d["lo"] / 1000,
+                                            datetime.timezone.utc)
+    assert first >= start, (
+        f"{model}: asked from {start:%m-%d %H:%M}, got data from "
+        f"{first:%m-%d %H:%M}")
+
+
+@pytest.mark.parametrize("model", MODELS)
 def test_spanning_window_joins_analyses_to_a_forecast(model):
     """Past half is analyses, future half is one run, seamed at the most
     recent initialization — so the leads span from the shortest to a

@@ -947,8 +947,16 @@ def getForecastData(startDate, endDate, model="gfs", variable="wind",
     seam = (ee.Date(run_ms).format("YYYY-MM-dd'T'HH:mm:ss'Z'")
             if iso else run_ms)
     before = _analyses(t0, t1).filter(ee.Filter.lt(valid_p, seam))
+    # LOCAL PATCH forecast window v1 (2026-10-05): the run's part starts at
+    # the later of the seam and the window start. From the seam alone, a
+    # window opening after the run began (any "next 3 days" asked at 19Z
+    # of a 06Z run) also got the run's hours before it - 85 hourly images
+    # for 72 hours, twelve of them already past, summed into the total.
+    lo_ms = ee.Number(run_ms).max(t0)
+    lo = (ee.Date(lo_ms).format("YYYY-MM-dd'T'HH:mm:ss'Z'")
+          if iso else lo_ms)
     after = ic.filter(ee.Filter.eq(run_p, latest_run)).filter(
-        ee.Filter.And(ee.Filter.gte(valid_p, seam),
+        ee.Filter.And(ee.Filter.gte(valid_p, lo),
                       ee.Filter.lte(valid_p, _v(t1))))
     return _out(before.merge(after))
 
