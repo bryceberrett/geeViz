@@ -1483,7 +1483,6 @@ def addEsriFeatureServiceClassed(
                       token),
         matched, token)
     features = geojson.get("features") or []
-    _label_fields(features, field_labels)
 
     # Split. One pass, first matching class wins, exactly as the per-class
     # SQL did - the classes are written to be disjoint and the floodway
@@ -1498,6 +1497,14 @@ def addEsriFeatureServiceClassed(
                 break
         else:
             leftovers.append(feature)
+
+    # LOCAL PATCH classed labels v1 (2026-10-05): labels AFTER the split.
+    # `match` names the service's own fields; renamed
+    # first, RISK_RATNG became "Overall risk rating (national)", no row
+    # matched any class, and every FEMA Risk Index layer drew empty from
+    # 2026-09-21 to 2026-10-05 - while the answer beside it read the same
+    # tracts fine through its own fetch.
+    _label_fields(features, field_labels)
 
     short = len(features) < matched
     for spec, rows in zip(classes, buckets):
