@@ -62,35 +62,36 @@ ArcGIS / Esri REST services client for geeViz. **DEPRECATED.**
    * renaming popup fields, ``visible``, and the one-fetch classed draw,
      which are geeViz map concerns rather than REST ones.
 
-Bridges three Esri service types into the existing geeViz viewer with no
-JavaScript changes required.  The viewer already supports both
-``tileMapService`` (for raster tiles) and ``geoJSONVector`` (for vector
-features) layer types.
+Bridges three Esri service types into the geeViz viewer:
 
 ======================================  ==================================================================================
 Service type                            Mechanism
 ======================================  ==================================================================================
-Image Service                           ``Map.addTileLayer("<url>/tile/{z}/{y}/{x}")``
+Image Service (cached)                  ``Map.addTileLayer("<url>/tile/{z}/{y}/{x}")``
+Image Service (uncached, e.g. NAIP)     ``Map.addDynamicMapService`` — ``<url>/exportImage`` per viewport
 Map Service (cached)                    ``Map.addTileLayer(...)`` — same tile path
-Feature Service (≤ ``max_features``)    Fetch ``<url>/query?f=geojson`` → ``Map.addLayer(geojson_dict)``
+Map Service (dynamic, e.g. FEMA NFHL)   ``Map.addDynamicMapService`` — ``<url>/export`` per viewport
+Feature Service (≤ ``max_features``)    ``<url>/query?f=geojson``, generalized for display → ``Map.addLayer(geojson_dict)``
 Feature Service (> ``max_features``)    ``ValueError`` with remediation message
 ======================================  ==================================================================================
 
-**Public API** — 7 functions + 1 constant::
+Usage -- georest to find and inspect, esriLib (or ``Map.addEsri*``) to
+draw::
 
     import geeViz.esriLib as el
+    from georest.restesri import portal
 
     # Discover data on any ArcGIS Portal
-    results = el.searchPortal("naip 2023")                  # IIPP (default)
-    results = el.searchPortal("naip 2023", portal="agol")   # ArcGIS Online
-    results = el.searchPortal("naip 2023",
-                              portal="https://myagency.gov/portal")
+    results = portal.searchPortal("naip")                     # IIPP (default)
+    results = portal.searchPortal("naip", portal="agol")      # ArcGIS Online
+    results = portal.searchPortal("naip",
+                                  portal="https://myagency.gov/portal")
 
     # Available portals
-    el.PORTALS.keys()   # iipp, agol, usgs, noaa, usfs, nasa
+    portal.PORTALS.keys()   # iipp, agol, usgs, noaa, usfs, nasa
 
     # Inspect any service
-    meta = el.getServiceMetadata("https://.../ImageServer")
+    meta = portal.getServiceMetadata("https://.../ImageServer")
 
     # Add to the geeViz map (auto-dispatches by service type)
     el.addEsriService(result_or_url)
@@ -107,7 +108,7 @@ Token-gated portals::
     #   POST <portal>/sharing/rest/generateToken
     #     username=...&password=...&client=requestip&expiration=60&f=json
     token = "..."
-    el.searchPortal("classified data", token=token)
+    portal.searchPortal("classified data", token=token)
     el.addEsriFeatureService(url, token=token)
 
 Copyright 2026 Ian Housman
@@ -521,13 +522,17 @@ def addEsriImageService(
     viz_params: dict | None = None,
     name: str | None = None,
     token: str | None = None,
-    target_map=None
+    target_map=None,
+    _meta: dict | None = None,
 ) -> None:
-    """Add an ArcGIS Image Service as an XYZ tile layer to the geeViz map.
+    """Add an ArcGIS Image Service to the geeViz map.
 
-    Constructs the ArcGIS tile URL pattern
-    ``<service_url>/tile/{z}/{y}/{x}`` and calls
-    ``geeViz.geeView.Map.addTileLayer``.
+    A CACHED service (its metadata reports ``tileInfo``) is added as an XYZ
+    tile layer on ``<service_url>/tile/{z}/{y}/{x}``. An UNCACHED one --
+    most of them, including every NAIP service on IIPP -- has no tiles to
+    serve; every ``/tile`` request answers 404 and the layer is blank. It
+    is drawn instead through ``<service_url>/exportImage``, re-rendered for
+    the viewport on each pan and zoom.
 
     .. note::
         ArcGIS tile URLs use ``{z}/{y}/{x}`` order (y before x), not the
@@ -568,6 +573,30 @@ def addEsriImageService(
     if name is None:
         name = url.rstrip("/").split("/")[-2] if url.endswith(("ImageServer", "imageserver")) else url.rstrip("/").split("/")[-1]
 
+    # Cached or not? getImageServiceTileUrl cannot tell -- it is string
+    # construction -- and an uncached service yields a well-formed
+    # template whose every tile is a 404. Ask the service. A failed
+    # lookup keeps the tile path, as addEsriMapService does: the caller
+    # may know the service is cached.
+    if _meta is None:
+        try:
+            from georest.restesri import portal as _gp_meta
+            _meta = _gp_meta.getServiceMetadata(url, token=token)
+        except Exception as _meta_err:
+            print(f"WARNING: could not read service metadata for {url!r} "
+                  f"({_meta_err}); assuming it is cached.")
+            _meta = None
+    if (_meta is not None and url.rstrip("/").lower().endswith("imageserver")
+            and "tileInfo" not in _meta and not _meta.get("singleFusedMapCache")):
+        print(f"Adding Esri Image Service (dynamic, exportImage): {name}")
+        (target_map or gv.Map).addDynamicMapService(
+            url,
+            name=name,
+            visible=bool((viz_params or {}).get("visible", True)),
+            token=token,
+        )
+        return
+
     # The {z}/{y}/{x} template -- ArcGIS order, y before x, not the XYZ
     # standard -- and the token quoting are georest's. The body here was
     # identical to it line for line, which is the kind of copy that gets
@@ -600,12 +629,14 @@ def addEsriMapService(
     target_map=None,
     visible: bool | None = None,
 ) -> None:
-    """Add a cached ArcGIS Map Service as an XYZ tile layer to the geeViz map.
+    """Add an ArcGIS Map Service to the geeViz map.
 
-    Cached Map Services expose the same ``/tile/{z}/{y}/{x}`` tile endpoint
-    as Image Services and are handled identically.  Dynamic (non-cached) Map
-    Services do not serve tiles this way; for those, use
-    :func:`addEsriFeatureService` on the individual sub-layer.
+    A cached service (``singleFusedMapCache: true``) is added as an XYZ
+    tile layer on ``/tile/{z}/{y}/{x}``. A dynamic one -- FEMA NFHL, most
+    authoritative government services -- is drawn through ``/export``,
+    re-rendered for the viewport on each pan and zoom, keeping the
+    server's own symbology. For the features themselves, use
+    :func:`addEsriFeatureService` on a sub-layer (``.../MapServer/<n>``).
 
     Args:
         url_or_result (str or dict): Service URL or :func:`searchPortal`
@@ -677,7 +708,8 @@ def addEsriMapService(
         )
         return
     # Cached — same tile URL shape as ImageServer
-    addEsriImageService(url_or_result, viz_params=viz_params, name=name, token=token, target_map=target_map)
+    addEsriImageService(url_or_result, viz_params=viz_params, name=name, token=token,
+                        target_map=target_map, _meta=_meta)
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1104,23 @@ _DEG_PER_M = 1.0 / 111_320.0
 #: about one screen pixel at the zoom where a whole national forest fits.
 _AUTO_TOLERANCES_M = (1, 5, 10, 20, 30, 50, 100)
 
+#: Tolerance ``simplify="auto"`` asks the SERVER to generalize to, in
+#: meters. A few pixels at street zoom, invisible below it; see
+#: addEsriFeatureService for what it saves.
+_SERVER_OFFSET_M_AUTO = 5
+
+
+def _georest_generalizes(services_module) -> bool:
+    """Whether this georest's queryFeatureService takes server-side
+    generalization (added after 0.4.0)."""
+    import inspect
+    try:
+        return "max_allowable_offset" in inspect.signature(
+            services_module.queryFeatureService).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 #: Default per-layer budget. Several layers share one page, and the page as
 #: a whole is refused by geeView above 25 MB.
 _LAYER_BUDGET_BYTES_DEFAULT = 8 * 1024 * 1024
@@ -1265,11 +1314,13 @@ def addEsriFeatureService(
             the label, in this order, ahead of any unlabelled field.
         visible (bool, optional): Whether the layer starts switched on.
         simplify (str, bool or float, optional): ``"auto"`` (default)
-            leaves a layer under *max_layer_mb* exactly as fetched and
-            otherwise simplifies it at increasing tolerances until it
-            fits -- the whole layer is embedded in the map page, and a
-            page that is too large never reaches the browser. A number
-            is a fixed tolerance in meters; ``False`` never alters the
+            asks the service for geometry generalized to ~5 m -- far
+            smaller and faster than full resolution -- then, if the layer
+            is still over *max_layer_mb*, simplifies it further at
+            increasing tolerances until it fits: the whole layer is
+            embedded in the map page, and a page that is too large never
+            reaches the browser. A number is a fixed tolerance in meters,
+            applied by the service. ``False`` fetches and keeps the exact
             geometry.
         max_layer_mb (float, optional): Size budget for this layer in the
             page, used by ``simplify="auto"``. Defaults to 8 MB.
@@ -1575,8 +1626,9 @@ def addEsriService(
     Example::
 
         import geeViz.esriLib as el
+        from georest.restesri import portal
 
-        results = el.searchPortal("naip 2023", limit=5)
+        results = portal.searchPortal("naip", limit=5)
         for r in results:
             el.addEsriService(r)  # dispatches by type automatically
     """
