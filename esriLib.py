@@ -870,9 +870,19 @@ def _page_features(query_url: str, params: dict, matched: int,
             added += 1
         return added
 
+    # LOCAL PATCH paging keeps the oid v1 (2026-10-08): a field list that
+    # leaves the OID out makes some servers (FEMA's NFHL MapServer) drop the
+    # GeoJSON feature `id` too - and with no identity `_harvest` must stop,
+    # so the whole layer drew as "0 of 21,742 drawn". The OID is asked for
+    # whenever a list omits it, and taken back out of the popup after.
+    wanted = [f.strip() for f in str(params.get("outFields") or "*").split(",")]
+    add_oid = "*" not in wanted and oid.lower() not in {w.lower() for w in wanted}
+
     def _page(extra: dict):
         page = dict(params)
         page["orderByFields"] = oid
+        if add_oid:
+            page["outFields"] = ",".join(wanted + [oid])
         page.update(extra)
         try:
             got = _fetch_json(query_url, page)
@@ -880,7 +890,14 @@ def _page_features(query_url: str, params: dict, matched: int,
             return None
         if not isinstance(got, dict) or "error" in got:
             return None
-        return got.get("features") or []
+        rows = got.get("features") or []
+        if add_oid:
+            for feat in rows:
+                props = feat.get("properties") or {}
+                fid = props.pop(oid, None)
+                if feat.get("id") is None and fid is not None:
+                    feat["id"] = fid
+        return rows
 
     # LOCAL PATCH esri paging v2 (2026-09-21): the pages are independent
     # under offset paging, and waiting for each in turn was the whole cost -
