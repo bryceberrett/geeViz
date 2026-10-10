@@ -3446,7 +3446,14 @@ class mapper:
                 _tpl = idDict.get("_tile_url_template", "")
                 _probe = (_tpl.replace("{z}", "1")
                               .replace("{x}", "0")
-                              .replace("{y}", "0"))
+                              .replace("{y}", "0")
+                              # LOCAL PATCH tile probe bbox v1 (2026-10-10):
+                              # the same world tile as a Web Mercator box. Left
+                              # as the literal "{bbox}", FEMA's export answers
+                              # HTTP 400, the export refuses, and the model
+                              # dropped the layer to get past it.
+                              .replace("{bbox}", "-20037508.342789244,0,0,"
+                                                 "20037508.342789244"))
                 try:
                     import urllib.request as _ur, urllib.error as _ue
                     _req = _ur.Request(_probe, method="HEAD")
