@@ -1623,6 +1623,18 @@ class mapper:
                 f"service_url must be an ArcGIS MapServer or ImageServer URL. "
                 f"Got: {service_url!r}"
             )
+        # LOCAL PATCH nfhl whole service v1 (2026-10-10): FEMA's NFHL drawn
+        # as a service shows only its coverage footprint below zoom 13 -
+        # solid red blocks that read as "all floodplain" (Bryce, Utah) -
+        # nothing at 13 and the zones from 14, under a grey legend bar.
+        # addEsriMapService routes dynamic services here, so this covers it.
+        if "hazards.fema.gov" in service_url.lower() and "/nfhl/" in service_url.lower():
+            raise ValueError(
+                "Do not draw FEMA's NFHL map service whole: zoomed out it "
+                "shows only FEMA's coverage footprint (red blocks), not flood "
+                "zones. For flood zones call hazard_answer with the words "
+                "'flood zones' and the place (e.g. 'flood zones in Utah "
+                "County') and run the map_hint it returns.")
         # Strip trailing slash + any /export or /exportImage suffix the
         # caller may have already appended — we build the query string
         # ourselves so the base is always the bare service URL.
