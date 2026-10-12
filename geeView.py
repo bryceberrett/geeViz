@@ -1490,6 +1490,12 @@ class mapper:
         opacity: float = 1.0,
         max_zoom: int = 20,
         legend: dict | None = None,
+        # LOCAL PATCH tile min zoom v1 (2026-10-12): below this zoom no tile
+        # is requested at all. FEMA's NFHL draws nothing below zoom 14, and
+        # every zoomed-out pan was asking it for ~20 blank tiles from the
+        # viewer's own address - load that may have got this machine
+        # refused by FEMA on 2026-10-12.
+        min_zoom: int = 0,
     ):
         """Add an external XYZ tile service (or any URL-templated raster
         service) to the map without leaving geeViz for Leaflet/Mapbox.
@@ -1550,6 +1556,7 @@ class mapper:
             "_is_tile_url": True,
             "_tile_url_template": url_template,
             "_tile_max_zoom": int(max_zoom),
+            "_tile_min_zoom": int(min_zoom or 0),
             "_tile_opacity": float(opacity),
             # Keep parallel item/viz so list-comprehension paths don't trip.
             "item": "",
@@ -2280,7 +2287,10 @@ class mapper:
                 # whatever characters it holds.
                 tile_url_fn = (
                     'function(coord,zoom){'
-                    'var _w=40075016.68557849,_h=_w/2,_t=_w/Math.pow(2,zoom),'
+                    # LOCAL PATCH tile min zoom v1 (2026-10-12): null = no request.
+                    + (f'if(zoom<{int(idDict.get("_tile_min_zoom") or 0)})return null;'
+                       if idDict.get("_tile_min_zoom") else '')
+                    + 'var _w=40075016.68557849,_h=_w/2,_t=_w/Math.pow(2,zoom),'
                     '_x0=-_h+coord.x*_t,_y1=_h-coord.y*_t,'
                     '_bb=[_x0,_y1-_t,_x0+_t,_y1].join(",");'
                     'return ' + _js_str(idDict["_tile_url_template"]) +

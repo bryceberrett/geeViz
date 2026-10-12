@@ -267,6 +267,13 @@ def _with_retries(call):
     last: BaseException | None = None
     for delay in (0,) + _RETRY_DELAYS:
         if delay:
+            # LOCAL PATCH paging progress v1 (2026-10-12): a retry is said,
+            # so a slow service is not silence. run_code stops a step after
+            # 120 s with no output; FEMA dropping connections on 2026-10-12
+            # made a whole Houston flood layer silent that long, the step
+            # was killed and the model redrew the map without it.
+            print(f"  the service did not answer; retrying in {delay} s",
+                  flush=True)
             time.sleep(delay)
         try:
             return call()
@@ -868,6 +875,10 @@ def _page_features(query_url: str, params: dict, matched: int,
             last = fid
             features.append(feat)
             added += 1
+        # LOCAL PATCH paging progress v1 (2026-10-12): one line a page for a
+        # layer that takes several, so a long download is visibly alive.
+        if added > 0 and matched and matched > 2000:
+            print(f"  fetched {len(features):,} of {matched:,}", flush=True)
         return added
 
     # LOCAL PATCH paging keeps the oid v1 (2026-10-08): a field list that
