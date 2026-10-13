@@ -776,7 +776,7 @@ async def _call_gemini_batch(
         response = await client.aio.models.generate_content(
             model=model,
             contents=contents,
-            config=types.GenerateContentConfig(
+            config=_lu.genai_config(
                 temperature=temperature,
                 response_mime_type="application/json",
             ),
@@ -870,7 +870,7 @@ async def _run_all_batches(
     from geeViz import googleMapsLib as _gm
 
     api_key = _gm._get_gemini_key()
-    client = genai.Client(api_key=api_key)
+    client = _lu.genai_client(api_key)
 
     try:
         # Chunk samples into batches
@@ -988,7 +988,7 @@ async def _consolidate_taxonomy(
         response = await client.aio.models.generate_content(
             model=model,
             contents=[prompt],
-            config=types.GenerateContentConfig(
+            config=_lu.genai_config(
                 temperature=0.0,
                 response_mime_type="application/json",
             ),
@@ -1558,7 +1558,7 @@ def _generate_category_colors(
     try:
         from google import genai
         import geeViz.googleMapsLib as _gm_local
-        client = genai.Client(api_key=_gm_local._get_gemini_key())
+        client = _lu.genai_client(_gm_local._get_gemini_key())
         cats_json = _json.dumps(list(categories))
         prompt = (
             "You color-code data-visualization categories so a chart "
@@ -1579,7 +1579,7 @@ def _generate_category_colors(
         resp = client.models.generate_content(
             model=model,
             contents=prompt,
-            config={"temperature": 0.0, "response_mime_type": "application/json"},
+            config=_lu.genai_config(temperature=0.0, response_mime_type="application/json"),
         )
         # Small call, but it runs once per inventory report and was the
         # last geeViz Gemini call reporting nothing.
@@ -2411,7 +2411,7 @@ def inventory_area(
         from geeViz import googleMapsLib as _gm
 
         async def _consolidate_with_cleanup():
-            client = genai.Client(api_key=_gm._get_gemini_key())
+            client = _lu.genai_client(_gm._get_gemini_key())
             try:
                 return await _consolidate_taxonomy(raw_set, model, client)
             finally:

@@ -54,6 +54,55 @@ from typing import Any, Callable, Optional
 #: Callers may still pass any model explicitly; this is only the default.
 DEFAULT_MODEL = "gemini-3.8-flash"
 
+
+# ── A client and a config without the log noise ──────────────────────
+#
+# Every geeViz Gemini call passes its key explicitly, yet google-genai
+# warns "Both GOOGLE_API_KEY and GEMINI_API_KEY are set" whenever both
+# variables exist, which reads like a misconfiguration and is not one.
+# And with automatic function calling (AFC) on, which is the default, it
+# logs about AFC on every call, though geeViz never passes tools. In the
+# MCP server both land in run_code's stderr, where they look like errors.
+
+_KEY_WARNING = "Both GOOGLE_API_KEY and GEMINI_API_KEY are set"
+
+
+class _DropKeyWarning:
+    """Drops only that one message; every other record passes."""
+
+    def filter(self, record) -> bool:
+        try:
+            return not str(record.getMessage()).startswith(_KEY_WARNING)
+        except Exception:
+            return True
+
+
+_key_filter = _DropKeyWarning()
+
+
+def genai_client(api_key: str):
+    """A ``google.genai.Client`` for ``api_key``, minus the misleading
+    both-keys warning (the key used is the one passed here)."""
+    import logging
+    from google import genai
+
+    lg = logging.getLogger("google_genai._api_client")
+    if _key_filter not in lg.filters:
+        lg.addFilter(_key_filter)
+    return genai.Client(api_key=api_key)
+
+
+def genai_config(**kwargs):
+    """A ``GenerateContentConfig`` with automatic function calling off.
+
+    geeViz passes no tools, so AFC does nothing but log on every call.
+    """
+    from google.genai import types
+
+    kwargs.setdefault("automatic_function_calling",
+                      types.AutomaticFunctionCallingConfig(disable=True))
+    return types.GenerateContentConfig(**kwargs)
+
 __all__ = [
     "DEFAULT_MODEL",
     "CANONICAL_FIELDS",

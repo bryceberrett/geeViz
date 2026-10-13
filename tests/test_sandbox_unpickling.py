@@ -270,3 +270,35 @@ def test_it_is_still_genuinely_unreferenced():
     assert len(uses) <= 2, (
         f"the allowlist is now referenced {len(uses)} times — if it is "
         f"enforced, remove the NOT ENFORCED banner")
+
+
+# ── runtime backstop: unpickling by any name ───────────────────────────
+#
+# The static check refuses calls NAMED like an unpickler; an alias is not
+# a name. ``f = pd.compat.pickle_compat.loads; f(payload)`` ran a
+# __reduce__ payload under --sandbox (2026-10-07 review). The audit hook
+# now refuses pickle.find_class while user code runs, from any frame.
+
+import pickle as _pickle
+
+from test_sandbox_trust import _run_under_sandbox
+
+
+class _Marker:
+    def __reduce__(self):
+        return (print, ("PWNED-BY-PICKLE",))
+
+
+_PAYLOAD = _pickle.dumps(_Marker())
+
+
+@pytest.mark.parametrize("call", [
+    "f = pd.compat.pickle_compat.loads\nf(b)",
+    "import io\nr = pd.read_pickle\nr(io.BytesIO(b))",
+    "g = getattr(pd, 'read_' + 'pickle')\nimport io\ng(io.BytesIO(b))",
+])
+def test_an_aliased_unpickler_is_refused_at_run_time(call):
+    code = f"import pandas as pd\nb = {_PAYLOAD!r}\n{call}"
+    result, full = _run_under_sandbox(code)
+    assert "PWNED-BY-PICKLE" not in full, "the payload executed"
+    assert result.startswith("SANDBOX_RESULT: BLOCKED"), full[-1500:]

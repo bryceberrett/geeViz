@@ -370,19 +370,17 @@ def test_release_products_lists_what_a_release_carries(stub_releases):
     assert "Land_Cover" in lcms.release_products("2024-10")
 
 
-def test_study_area_coverage_is_not_monotonic():
-    """Newer is not always broader.
-
-    2024-10 covers HAWAII and PRUSVI; 2025-11 does not. Work in those
-    areas has to pin an OLDER release, which is the opposite of the
-    usual advice and easy to get wrong by reaching for "latest".
-    """
+def test_study_areas_are_listed_by_the_names_each_release_uses():
+    """The 2025-11 Earth Engine asset covers Hawaii and Puerto Rico through
+    2025 (live catalog, 2026-10-09), so nothing should send that work to
+    the deprecated 2024-10 and lose 2025. The names change, though: 2025-11
+    says HI where 2024-10 said HAWAII, and a filter on the old name
+    matches nothing."""
     from geeViz.fsInsights.lcms_ee import RELEASE_STUDY_AREAS
 
-    newer = set(RELEASE_STUDY_AREAS["2025-11"])
-    older = set(RELEASE_STUDY_AREAS["2024-10"])
-    assert {"HAWAII", "PRUSVI"} <= older
-    assert not ({"HAWAII", "PRUSVI"} & newer)
+    assert set(RELEASE_STUDY_AREAS["2025-11"]) == {"CONUS", "AK", "HI", "PRUSVI"}
+    assert "HAWAII" in RELEASE_STUDY_AREAS["2024-10"]
+    assert "HAWAII" not in RELEASE_STUDY_AREAS["2025-11"]
 
 
 def test_mismatch_message_is_ascii(stub_releases):

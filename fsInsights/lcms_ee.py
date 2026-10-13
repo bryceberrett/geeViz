@@ -45,11 +45,12 @@ _CURRENT = "projects/gtac-data-publish/assets/LCMS/Product_Version/2025-11"
 #: moved out of the ``USFS/GTAC`` namespace, so this is a lookup rather
 #: than a formatted path.
 #:
-#: Worth knowing before pinning: **study-area coverage is not
-#: monotonic.** ``2024-10`` covers CONUS, AK, HAWAII and PRUSVI, while
-#: the newer ``2025-11`` covers only CONUS and AK. Work in Hawaii or
-#: Puerto Rico has to pin an OLDER release — the opposite of the usual
-#: advice, and easy to get wrong by reaching for "latest".
+#: Worth knowing before pinning: **study areas and their names change
+#: between releases.** In Earth Engine, ``2025-11`` covers CONUS, AK, HI
+#: and PRUSVI (1985-2025); ``2024-10`` named Hawaii ``HAWAII`` and ``2023-9``
+#: had SE Alaska only (``SEAK``). Filter on the names the release you use
+#: actually carries. (The LCMS *API*'s pre-computed summaries are a
+#: separate thing with their own coverage; see ``lcms.py``.)
 #:
 #: ``2025-6`` is absent on purpose: it is a tree-canopy release with no
 #: Change / Land_Cover / Land_Use products.
@@ -66,7 +67,7 @@ _BY_RELEASE = {
 #: Study areas per release, for the coverage question above. Only the
 #: releases whose coverage differs from the current one are listed.
 RELEASE_STUDY_AREAS = {
-    "2025-11": ("CONUS", "AK"),
+    "2025-11": ("CONUS", "AK", "HI", "PRUSVI"),
     "2025-6":  ("CONUS", "AK"),
     "2024-10": ("CONUS", "AK", "HAWAII", "PRUSVI"),
     "2023-9":  ("CONUS", "SEAK", "HAWAII", "PRUSVI"),

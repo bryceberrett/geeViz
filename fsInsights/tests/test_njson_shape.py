@@ -163,6 +163,47 @@ def test_grand_total_is_emitted_and_matches_the_documented_example():
     assert g[0]["se_pct"] == pytest.approx(0.51)
 
 
+# One grouping only. Shape observed live for wc=532023, snum=2,
+# rselected='Forest type': NJSON still sends subtotals over GRP1, and with
+# no column to total across they are the estimates again, row for row.
+NJSON_R = {
+    "metadata": {"FIAorRPA": "FIADEF", "evalGrps": ["Washington 532023"],
+                 "numEstDesc": "0002 Area of forest land, in acres"},
+    "estimates": [
+        {"GRP1": "`0201 Douglas-fir", "ESTIMATE": 8699497.93,
+         "SE_PERCENT": 1.77, "PLOT_COUNT": 2651},
+        {"GRP1": "`0321 Western larch", "ESTIMATE": 398508.35,
+         "SE_PERCENT": 9.45, "PLOT_COUNT": 183},
+    ],
+    "subtotals": {
+        "GRP1": [
+            {"GRP1": "`0201 Douglas-fir", "ESTIMATE": 8699497.93,
+             "SE_PERCENT": 1.77, "PLOT_COUNT": 2651},
+            {"GRP1": "`0321 Western larch", "ESTIMATE": 398508.35,
+             "SE_PERCENT": 9.45, "PLOT_COUNT": 183},
+        ],
+    },
+    "totals": [{"ESTIMATE": 22023464.22, "SE_PERCENT": 0.52,
+                "PLOT_COUNT": 5905}],
+}
+
+
+def test_one_way_table_lists_each_row_once():
+    """A row marginal is only a marginal when there is a column to total.
+
+    Without one, re-emitting the subtotals as column='Total' listed every
+    forest type twice, doubled reliable_count/unreliable_count in
+    fia_estimate, and would double any sum the model took over the rows.
+    """
+    rows = _rows(NJSON_R, selections=(False, True, False))
+    larch = [r for r in rows if "Western larch" in str(r["row"])]
+    assert len(larch) == 1
+    assert larch[0]["estimate"] == pytest.approx(398508.35)
+    assert len(rows) == 3  # two forest types and the grand total
+    g = [r for r in rows if r["row"] == "Total"]
+    assert len(g) == 1 and g[0]["estimate"] == pytest.approx(22023464.22)
+
+
 def test_se_pct_uses_se_percent_not_absolute_se():
     """SE and SE_PERCENT are both present and wildly different.
 

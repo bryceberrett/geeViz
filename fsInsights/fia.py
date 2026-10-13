@@ -449,10 +449,13 @@ def _to_frame(payload: Any, *, max_se_pct: float, min_plots: int,
         if isinstance(subs, dict):
             # A marginal over the ROW grouping varies by row and is
             # totalled across columns -> column='Total', and vice versa.
-            if grp_for["row"]:
+            # With only one grouping there is nothing to total across:
+            # the subtotals ARE the estimates, and re-emitting them would
+            # list every row twice.
+            if grp_for["row"] and (grp_for["column"] or grp_for["page"]):
                 for rec in subs.get(grp_for["row"]) or []:
                     _add(rec.get(grp_for["row"]), "Total", rec)
-            if grp_for["column"]:
+            if grp_for["column"] and (grp_for["row"] or grp_for["page"]):
                 for rec in subs.get(grp_for["column"]) or []:
                     _add("Total", rec.get(grp_for["column"]), rec)
 

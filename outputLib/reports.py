@@ -1261,7 +1261,7 @@ class Report:
             )
 
         from google import genai
-        self._client = genai.Client(api_key=key)
+        self._client = _lu.genai_client(key)
         return self._client
 
     def _llm(self, prompt_text, images=None):
@@ -1292,7 +1292,7 @@ class Report:
             response = client.models.generate_content(
                 model=self.model,
                 contents=contents,
-                config=types.GenerateContentConfig(temperature=0.0),
+                config=_lu.genai_config(temperature=0.0),
             )
             # Report what this cost. A report runs one of these per
             # section plus an executive summary over every image, so it

@@ -234,6 +234,20 @@ def test_the_archive_really_reaches_back_that_far(key):
         f"{key}: archive_start says {declared}, earliest image is {got}")
 
 
+@pytest.mark.parametrize("key", ["weathernext"])  # the models that declare archive_gaps
+def test_the_declared_archive_gaps_really_are_empty(key):
+    """WeatherNext 3 has 2024 and 2026 on, but no 2025. A gap the table
+    declares must hold no images, or the table is telling callers a
+    window is empty when it is not."""
+    import ee
+    import geeViz.weather as wx
+    spec = wx.MODELS[key]
+    coll = ee.ImageCollection(spec["collection"])
+    n = ee.List([coll.filterDate(a, b).limit(1).size() for a, b in spec["archive_gaps"]]).getInfo()
+    for (a, b), k in zip(spec["archive_gaps"], n):
+        assert k == 0, f"{key}: archive_gaps says {a}..{b} is empty, but it has images"
+
+
 def test_the_docstring_table_quotes_the_declared_numbers():
     """The table is prose beside data, which is how the two drift.
 

@@ -322,6 +322,18 @@ if _SANDBOX_ENABLED:
             if _called_from_trusted_lib():
                 return
             raise PermissionError(f"Sandbox: {event} is blocked.")
+        elif event == "pickle.find_class":
+            # Unpickling, by whatever name it is reached. The static check
+            # refuses calls NAMED like an unpickler, but an alias is not a
+            # name: ``f = pd.compat.pickle_compat.loads; f(payload)`` ran a
+            # __reduce__ payload. Every unpickle that loads a callable
+            # passes through find_class, so refuse it for as long as user
+            # code runs, and from trusted frames too: the payload executes
+            # inside the library's own frames, which is exactly what makes
+            # them look trusted.
+            raise PermissionError(
+                "Sandbox: unpickling is blocked (it can run arbitrary code). "
+                "Load data from JSON, CSV, GeoJSON or Earth Engine instead.")
         elif event == "open":
             # Path-scoped file access. Original design: block deny-listed
             # paths REGARDLESS of caller so attackers couldn't smuggle
@@ -792,6 +804,10 @@ try:
             "quality, solar, timezone, roads) remain available."
         )
     _SERVER_INSTRUCTIONS = _SERVER_INSTRUCTIONS.replace("<!--GMAPS_AI_STATUS-->", _ai_block)
+    # Street View: same env var googleMapsLib enforces (set by run_ui from
+    # tenant.tools.enable_street_view; absent = on for standalone use).
+    from geeViz.googleMapsLib import street_view_instructions, street_view_enabled
+    _SERVER_INSTRUCTIONS = street_view_instructions(_SERVER_INSTRUCTIONS, street_view_enabled())
     print(f"[geeViz MCP] Loaded instructions: {len(_SERVER_INSTRUCTIONS)} chars, {len(_SERVER_INSTRUCTIONS.split())} words (gmaps AI: {'ENABLED' if _ai_on else 'DISABLED'})", file=sys.stderr, flush=True)
 except Exception:
     _SERVER_INSTRUCTIONS = None
@@ -1293,6 +1309,12 @@ import datetime as _datetime
 _LOG_DIR = os.path.join(_THIS_DIR, "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _TOOL_LOG_FILE = os.path.join(_LOG_DIR, "tool_calls.log")
+
+# httpx logs every request at INFO ("HTTP Request: POST ... 200 OK").
+# Inside run_code that lands in the call's stderr, where a successful
+# Gemini call reads like a failure. Warnings and errors still show.
+for _noisy in ("httpx", "httpcore"):
+    _logging.getLogger(_noisy).setLevel(_logging.WARNING)
 
 _tool_logger = _logging.getLogger("geeViz.mcp.tools")
 _tool_logger.setLevel(_logging.DEBUG)
@@ -1802,7 +1824,54 @@ def _get_session(session_id: str | None = None) -> _SessionState:
     with _sessions_lock:
         if sid not in _sessions:
             _sessions[sid] = _SessionState(sid)
+            if sid != _DEFAULT_SESSION_ID:
+                _recover_history(_sessions[sid])
         return _sessions[sid]
+
+
+_RUN_CODE_CALL_MARK = _wl_re.compile(r"^# --- run_code call \d+ ---\n", _wl_re.M)
+
+
+def _recover_history(sess: "_SessionState") -> None:
+    """Reload a session's code history from its saved script, if any.
+
+    The history lives in memory, so a restarted server (a deploy, an
+    idle shutdown, another instance) met "save this script" in a session
+    that had run code with "No code has been executed yet". Every
+    successful run_code also rewrites ``<script_dir>/session_*.py`` with
+    one marked section per call; the newest such file is the history.
+    Variables are not restored, only the code.
+    """
+    try:
+        files = [os.path.join(sess.script_dir, f) for f in os.listdir(sess.script_dir)
+                 if f.startswith("session_") and f.endswith(".py")]
+    except FileNotFoundError:
+        return
+    if not files:
+        return
+    newest = max(files, key=os.path.getmtime)
+    try:
+        with open(newest, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return
+    blocks = [b.strip("\n") for b in _RUN_CODE_CALL_MARK.split(text)[1:] if b.strip()]
+    for block in blocks:
+        a = _analyze_block_ast(block)
+        sess.code_history.append(block)
+        sess.code_history_meta.append({
+            "source": block,
+            "names_bound": set(a["bound_static"]),
+            "names_read": set(a["read"]),
+            "names_touched": set(a["touched"]),
+            "is_import": a["is_import"],
+            "wildcard_import": a["wildcard_import"],
+            "parse_error": a["parse_error"],
+            "succeeded": True,
+            "recovered": True,
+        })
+    if blocks:
+        sess.current_script_path = newest
 
 
 # Backward-compatible module-level references for non-session-aware code
@@ -2049,6 +2118,51 @@ def _ensure_initialized_locked(session_id: str | None = None):
     def _session_save_file(filename, content, mode="w"):
         return _safe_write_file(filename, content, mode, output_dir=sess.output_dir)
 
+    # Files the user uploaded in this conversation. The web server stages
+    # each converted vector upload (shapefile, KML, GPKG, GeoJSON...) as
+    # GeoJSON in <session output dir>/uploads/. Without this the only copy
+    # was the GeoJSON pasted into the prompt, which the model had to
+    # retype into code: a large layer came back cut short or empty.
+    _uploads_dir = os.path.join(sess.output_dir, "uploads")
+
+    def _session_list_uploads():
+        """Names of the files uploaded in this conversation, for load_upload()."""
+        try:
+            return sorted(f for f in os.listdir(_uploads_dir) if not f.startswith("."))
+        except FileNotFoundError:
+            return []
+
+    def _session_load_upload(name=None):
+        """Read a file the user uploaded in this conversation.
+
+        Vector uploads are stored as GeoJSON and come back as a dict, ready
+        for ``ee.FeatureCollection(load_upload("name"))`` with every vertex
+        and attribute intact. ``name`` may be the stored name or the name
+        the user uploaded ("tracts.zip" finds "tracts.geojson"); with one
+        upload it may be omitted.
+        """
+        names = _session_list_uploads()
+        if not names:
+            raise FileNotFoundError(
+                "No uploads in this conversation. If the user mentions a file, "
+                "it never arrived: say so and ask them to attach it.")
+        if name is None:
+            if len(names) != 1:
+                raise ValueError(f"Several uploads; pass one of {names}")
+            pick = names[0]
+        else:
+            want = os.path.basename(str(name)).lower()
+            stem = want.rsplit(".", 1)[0] if "." in want else want
+            pick = (next((n for n in names if n.lower() == want), None)
+                    or next((n for n in names if n.lower().rsplit(".", 1)[0] == stem), None))
+            if pick is None:
+                raise FileNotFoundError(f"No upload named {name!r}; uploads: {names}")
+        path = os.path.join(_uploads_dir, pick)
+        with open(path, encoding="utf-8") as fh:
+            if pick.lower().endswith((".geojson", ".json")):
+                return json.load(fh)
+            return fh.read()
+
     sess._map_ref = session_map
     # Helpful stubs that fire when the agent accidentally tries to call an
     # MCP tool name as a Python function INSIDE run_code. The session audit
@@ -2090,6 +2204,8 @@ def _ensure_initialized_locked(session_id: str | None = None):
         "numpy": _np_mod,
         "np": _np_mod,
         "save_file": _session_save_file,
+        "load_upload": _session_load_upload,
+        "list_uploads": _session_list_uploads,
         # Clear-error stubs for MCP tool names the agent sometimes calls
         # from inside run_code as if they were Python functions.
         "search_datasets": _mcp_tool_stub("search_datasets"),
@@ -2325,7 +2441,7 @@ def _diff_namespace(before: dict, after: dict, skip_names: set = None) -> set:
 # block that happens to reference them.
 _REPL_BOOTSTRAP_NAMES = {
     "ee", "Map", "gv", "gil", "sal", "cl", "tl", "rl", "gm",
-    "palettes", "save_file", "__builtins__",
+    "palettes", "save_file", "load_upload", "list_uploads", "__builtins__",
 }
 
 
@@ -2679,6 +2795,114 @@ _UNPICKLING_CALLS = frozenset({
     "load_npz",         # scipy.sparse — unpickles object arrays
 })
 
+
+def _is_stdlib_json_loads(call: ast.Call, tree: ast.Module) -> bool:
+    """True for ``json.loads(...)`` where ``json`` is provably the stdlib.
+
+    ``json.loads`` parses text and cannot unpickle, but the name check
+    above refused it, so the agent could not parse a GeoJSON string and
+    retyped 23 neighborhood polygons as a Python literal instead (prod
+    session fca4b979, 2026-10-07). Exempt it only when this same block
+    does a top-level ``import json`` before the call and binds ``json``
+    nowhere else -- the namespace persists between calls, so a ``json``
+    left over from an earlier block proves nothing.
+    """
+    f = call.func
+    if not (isinstance(f, ast.Attribute) and f.attr == "loads"
+            and isinstance(f.value, ast.Name) and f.value.id == "json"):
+        return False
+    imported = any(
+        isinstance(s, ast.Import) and s.lineno < call.lineno
+        and any(a.name == "json" and a.asname in (None, "json")
+                for a in s.names)
+        for s in tree.body)
+    if not imported:
+        return False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id == "json" and not isinstance(n.ctx, ast.Load):
+            return False
+        if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                and n.value.id == "json" and not isinstance(n.ctx, ast.Load)):
+            return False  # json.loads = <something that unpickles>
+        if isinstance(n, ast.alias) and n.asname == "json" and n.name != "json":
+            return False
+        if isinstance(n, ast.ImportFrom) and any(
+                a.asname is None and a.name == "json" for a in n.names):
+            return False
+        if isinstance(n, ast.arg) and n.arg == "json":
+            return False
+        if (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                           ast.ExceptHandler, ast.MatchAs, ast.MatchStar))
+                and getattr(n, "name", None) == "json"):
+            return False
+        if isinstance(n, ast.MatchMapping) and n.rest == "json":
+            return False
+        if isinstance(n, (ast.Global, ast.Nonlocal)) and "json" in n.names:
+            return False
+    return True
+
+
+#: The module-level esriLib drawing helpers. Called bare they draw on
+#: ``gv.Map`` -- the process-wide map -- not the per-session map that
+#: run_code exposes as ``Map`` and map_control exports. The layer is
+#: "added" (it even prints "Adding layer: ...") and never appears.
+_ESRI_DRAW_FUNCS = frozenset({
+    "addEsriFeatureService", "addEsriService", "addEsriMapService",
+    "addEsriImageService", "addEsriTileLayer",
+})
+
+
+def _esri_off_map_calls(code: str) -> list[str]:
+    """BLOCKED messages for esriLib draw calls that would miss ``Map``.
+
+    Prod session 8f659285 (2026-10-07): ``from geeViz.esriLib import
+    addEsriFeatureService`` then ``addEsriFeatureService(url, ...)`` --
+    the WFIGS perimeters printed "Adding layer" and were absent from the
+    exported map. ``Map.addEsriFeatureService(...)`` passes
+    ``target_map=self``; so does any call that passes ``target_map=``.
+    Only meaningful when the session map is not ``gv.Map``; the caller
+    decides that.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    funcs, mods = {}, set()  # local name -> esriLib name
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module == "geeViz.esriLib":
+            funcs.update((a.asname or a.name, a.name) for a in n.names
+                         if a.name in _ESRI_DRAW_FUNCS)
+        elif isinstance(n, ast.ImportFrom) and n.module == "geeViz":
+            mods.update(a.asname or a.name for a in n.names
+                        if a.name == "esriLib")
+        elif isinstance(n, ast.Import):
+            mods.update(a.asname for a in n.names
+                        if a.name == "geeViz.esriLib" and a.asname)
+    out = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        f = n.func
+        if isinstance(f, ast.Name) and f.id in funcs:
+            fn = funcs[f.id]
+        elif (isinstance(f, ast.Attribute) and f.attr in _ESRI_DRAW_FUNCS
+              and isinstance(f.value, ast.Name) and f.value.id in mods):
+            fn = f.attr
+        elif (isinstance(f, ast.Attribute) and f.attr in _ESRI_DRAW_FUNCS
+              and ast.unparse(f.value) == "geeViz.esriLib"):
+            fn = f.attr
+        else:
+            continue
+        if any(k.arg == "target_map" for k in n.keywords):
+            continue
+        out.append(
+            f"BLOCKED: esriLib {fn}() without target_map draws on a "
+            f"different map than this session's `Map`, so the layer never "
+            f"appears in the viewer or the export. Call "
+            f"Map.{fn}(...) with the same arguments instead."
+        )
+    return out
+
 #: Module names that must not be reachable as an ATTRIBUTE of something
 #: else. Any module that does ``import os`` at the top re-exports it:
 #: ``gil.os``, ``gv.os`` and ``cl.os`` are all the real os module, so the
@@ -2916,7 +3140,8 @@ def _check_code_patterns(code: str) -> list[str]:
                 _fname = node.func.attr
             elif isinstance(node.func, ast.Name):
                 _fname = node.func.id
-            if _fname in _UNPICKLING_CALLS:
+            if (_fname in _UNPICKLING_CALLS
+                    and not _is_stdlib_json_loads(node, tree)):
                 warnings.append(
                     f"BLOCKED: '{_fname}()' deserializes pickled data, which "
                     f"executes arbitrary code. Load data with a format that "
@@ -2977,6 +3202,42 @@ def _check_code_patterns(code: str) -> list[str]:
                 "Consider adding .limit(N) or using .first().getInfo()."
             )
 
+    # --- Training accuracy reported as validation accuracy ---
+    # Classifier.confusionMatrix() scores the classifier on the samples it
+    # was trained on, and an answer called that "cross-validation accuracy"
+    # (daily review 2026-10-12). A note, not a block: it is a fine thing
+    # to look at, just not the number to report.
+    if any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+           and n.func.attr == "confusionMatrix" for n in ast.walk(tree)):
+        warnings.append(
+            "Note: classifier.confusionMatrix() is accuracy on the classifier's "
+            "own training samples, which overstates real accuracy. Do not "
+            "report it as validation or cross-validation accuracy. For an "
+            "honest figure, hold samples out (samples.randomColumn() split), "
+            "train on the rest, then held_out.classify(clf).errorMatrix(label, "
+            "'classification'). If you report the training figure, call it "
+            "training accuracy."
+        )
+
+    # --- EE performance: many separate .getInfo() calls in one block ---
+    # Each one is its own server round trip. The instructions say to batch
+    # them into one ee.Dictionary, and models still write five in a row
+    # (accuracy, kappa, matrix, producers, consumers: session b2dffb2c,
+    # 2026-10-09). Like the loop case, this is enforced, not suggested.
+    _MAX_GETINFO = 3
+    _n_getinfo = sum(1 for n in ast.walk(tree)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "getInfo")
+    if _n_getinfo > _MAX_GETINFO:
+        warnings.append(
+            f"BLOCKED: {_n_getinfo} separate .getInfo() calls in one block; each is "
+            f"its own server round trip (at most {_MAX_GETINFO} allowed). Put the "
+            "values in ONE ee.Dictionary and call .getInfo() once, e.g. "
+            "vals = ee.Dictionary({'acc': cm.accuracy(), 'kappa': cm.kappa(), "
+            "'matrix': cm.array(), 'bands': img.bandNames()}).getInfo(); then read "
+            "vals['acc'] etc. Fetch a value once and reuse the Python variable."
+        )
+
     # Deduplicate while preserving order
     seen: set[str] = set()
     unique: list[str] = []
@@ -2985,6 +3246,54 @@ def _check_code_patterns(code: str) -> list[str]:
             seen.add(w)
             unique.append(w)
     return unique
+
+
+def _dedupe_new_outputs(new_files, files_before, output_dir, max_bytes=200 * 1024 * 1024):
+    """One output per distinct content among the files a run_code call wrote.
+
+    Returns ``None`` when nothing was duplicated, else ``(kept, note)``:
+    ``kept`` lists the files to show, ``note`` tells the model what was
+    left out and why. Of identical files, a NEW name is kept over one that
+    re-saved an earlier output's name; then the first written. The
+    duplicates stay on disk; they are only not shown again.
+    """
+    import hashlib
+    groups: dict = {}
+    for f in new_files:
+        p = os.path.join(output_dir, f)
+        try:
+            if os.path.getsize(p) > max_bytes:
+                groups.setdefault(("big", f), []).append(f)
+                continue
+            with open(p, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            groups.setdefault(("err", f), []).append(f)
+            continue
+        groups.setdefault(("sha", digest), []).append(f)
+    dupes = {k: v for k, v in groups.items() if len(v) > 1}
+    if not dupes:
+        return None
+
+    def _rank(f):
+        p = os.path.join(output_dir, f)
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            mt = 0
+        return (f in files_before, mt, f)        # new names first, then oldest write
+
+    kept, skipped = [], []
+    for v in groups.values():
+        v = sorted(v, key=_rank)
+        kept.append(v[0])
+        skipped += [(s, v[0]) for s in v[1:]]
+    kept = sorted(kept)
+    note = ("Note: the same content was saved under more than one name; it is "
+            "shown once. " + "; ".join(f"{s} is identical to {k}" for s, k in skipped)
+            + ". Save each output once, under one name: saving over an earlier "
+            "output's name does not replace its preview, it adds another.")
+    return kept, note
 
 
 def _get_method_chain(node: ast.AST) -> list[str]:
@@ -3232,6 +3541,15 @@ _EE_ERROR_HINTS = [
         "pass with ee.FeatureCollection(list_of_features), or replace "
         ".filterBounds(big_fc) with ee.Geometry.BBox(...).",
     ),
+    (
+        "Please specify a non-zero error margin",
+        "HINT: The geometry is planar (ee.Geometry.BBox(...) always is, and "
+        "so is anything built with geodesic=False), and area / perimeter / "
+        "centroid / intersection / union on it need an error margin. Pass "
+        "one: geom.area(maxError=1), geom.centroid(maxError=1), "
+        "a.intersection(b, maxError=1). Or build the box with "
+        "ee.Geometry.Rectangle([w, s, e, n]), which is geodesic.",
+    ),
 ]
 
 
@@ -3250,6 +3568,37 @@ def _translate_ee_error(error_text: str) -> str:
         if needle in error_text:
             return f"{hint}\n\n--- original traceback below ---\n{error_text}"
     return error_text
+
+
+_NAME_ERROR_RE = _wl_re.compile(r"NameError: name '(\w+)' is not defined")
+
+
+def _lost_state_hint(error_text: str, sess: "_SessionState") -> str:
+    """Explain a NameError for a name no run_code call in this process bound.
+
+    Variables live in this process's memory. A deploy, an idle shutdown or
+    Cloud Run moving the session to another instance clears them between
+    turns, and the model, seeing a bare NameError for a variable it made
+    earlier, probes with globals() / dir() instead of re-creating it.
+    History reloaded by _recover_history does not count: it brings back the
+    code, not the variables.
+    """
+    m = _NAME_ERROR_RE.search(error_text or "")
+    if not m:
+        return error_text
+    name = m.group(1)
+    if any(name in meta.get("names_bound", ()) for meta in sess.code_history_meta
+           if not meta.get("recovered")):
+        return error_text
+    hint = (
+        f"HINT: No call in this session's current Python state has defined "
+        f"'{name}'. If an earlier call did, its variables are gone: a server "
+        f"restart or a move to another server clears them between turns. "
+        f"Re-run the code that defined '{name}' (and anything it depends on) "
+        f"at the top of this call. Do not probe with globals() or dir(), "
+        f"and do not open files an earlier call saved: they may be gone too."
+    )
+    return f"{hint}\n\n--- original traceback below ---\n{error_text}"
 
 
 # ---------------------------------------------------------------------------
@@ -3439,7 +3788,8 @@ async def run_code(code: str, timeout: int = 120, reset: bool = False,
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 for alias in node.names:
                     bound_name = alias.asname or alias.name.split(".")[-1]
-                    if bound_name in ("ee", "Map", "gv", "gil", "sal", "cl", "tl", "rl", "gm", "palettes", "save_file"):
+                    if bound_name in ("ee", "Map", "gv", "gil", "sal", "cl", "tl", "rl", "gm", "palettes", "save_file",
+                                      "load_upload", "list_uploads"):
                         skip = True
                         break
             if not skip:
@@ -3452,6 +3802,9 @@ async def run_code(code: str, timeout: int = 120, reset: bool = False,
 
     # Static analysis: detect risky and blocked patterns before execution
     code_warnings = _check_code_patterns(code)
+    import geeViz.geeView as _gv_mod
+    if sess._map_ref is not _gv_mod.Map:
+        code_warnings += _esri_off_map_calls(code)
 
     # Refuse execution if any BLOCKED patterns were found
     blocked = [w for w in code_warnings if w.startswith("BLOCKED:")]
@@ -3626,7 +3979,7 @@ async def run_code(code: str, timeout: int = 120, reset: bool = False,
             "stdout": stdout_buf.getvalue(),
             "stderr": stderr_val,
             "result": None,
-            "error": _translate_ee_error(error_holder[0]),
+            "error": _lost_state_hint(_translate_ee_error(error_holder[0]), sess),
             "script_path": None,
         })
 
@@ -3672,6 +4025,14 @@ async def run_code(code: str, timeout: int = 120, reset: bool = False,
         if f not in _files_before or mt > _mtimes_before.get(f, 0):
             _new_files.append(f)
     _new_files = sorted(_new_files)
+    # The same bytes saved under two names in one call would show (and
+    # download) twice in the chat. Models do this believing a save over an
+    # earlier output's name replaces its preview; it does not, it adds one
+    # (session f3c49da1, 2026-10-09). Show each distinct file once,
+    # preferring a new name over re-saving an older one, and say so.
+    _dup_note = _dedupe_new_outputs(_new_files, _files_before, sess.output_dir)
+    if _dup_note:
+        _new_files = _dup_note[0]
     _IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
     output_markdown = None
     if _new_files:
@@ -3713,6 +4074,8 @@ async def run_code(code: str, timeout: int = 120, reset: bool = False,
     )
     if len(stdout_val) > 50000:
         stdout_val = stdout_val[:50000] + "\n... (truncated)"
+    if _dup_note:
+        stdout_val = (stdout_val.rstrip("\n") + "\n" if stdout_val else "") + _dup_note[1]
 
     return _scrub_json_response({
         "success": True,

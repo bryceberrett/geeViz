@@ -166,3 +166,24 @@ def test_mapper_wrappers_accept_the_new_options():
     for fn in (gv.mapper.addEsriFeatureService, gv.mapper.addEsriService):
         params = inspect.signature(fn).parameters
         assert "simplify" in params and "bbox" in params, fn.__name__
+
+
+@pytest.mark.parametrize("bbox", [(-124.6, 41.9, -121.5, 46.3),
+                                  [-124.6, 41.9, -121.5, 46.3]])
+def test_bbox_tuple_reaches_georest_as_a_bbox_string(monkeypatch, bbox):
+    """A user excluding this year's Oregon fires passed bbox as a 4-tuple;
+    georest parses only "xmin,ymin,xmax,ymax", sent the tuple as a JSON
+    list, and the service answered "'geometry' parameter is invalid"."""
+    el = _el()
+    from georest.restesri import services as gs
+    seen = {}
+
+    def _q(*a, **k):
+        seen.update(k)
+        return _fc(1, 10)
+
+    monkeypatch.setattr(gs, "queryFeatureService", _q)
+    monkeypatch.setattr(el, "_check_url", lambda u: None)
+    el.addEsriFeatureService("https://example.test/arcgis/rest/services/X/FeatureServer/0",
+                             name="fires", target_map=_FakeMap(), bbox=bbox)
+    assert seen["geometry"] == "-124.6,41.9,-121.5,46.3"

@@ -5150,12 +5150,41 @@ def _is_multi_feature(geometry):
         return False
 
 
+#: Distinct time stamps this far apart or more are separate moments, not
+#: tiles of one acquisition. Scenes along one Landsat path or Sentinel-2
+#: datatake are seconds apart; hourly forecasts are an hour apart.
+_SUB_DAILY_MIN_GAP_MS = 30 * 60 * 1000
+
+
+def _is_sub_daily(times_ms):
+    """True when ``times_ms`` are separate moments within a single day.
+
+    That is: at least two distinct stamps fall on the same UTC day, and
+    no two distinct stamps are closer than :data:`_SUB_DAILY_MIN_GAP_MS`.
+    Hourly WeatherNext is; same-day scene tiles (seconds apart) and
+    one-stamp-per-day or per-year collections (LCMS) are not, and keep
+    being mosaicked per day.
+    """
+    ts = sorted(set(t for t in times_ms if t is not None))
+    if len(ts) < 2:
+        return False
+    day_ms = 24 * 60 * 60 * 1000
+    gaps = [b - a for a, b in zip(ts, ts[1:])]
+    same_day = len({t // day_ms for t in ts}) < len(ts)
+    return same_day and min(gaps) >= _SUB_DAILY_MIN_GAP_MS
+
+
 def _mosaic_by_date(col):
     """Mosaic a tiled ImageCollection by unique date, preserving projection.
 
     Groups images by ``system:time_start`` (truncated to day) and mosaics
     each group into a single image. This handles tiled datasets like LCMS
     that have multiple spatial tiles per time step.
+
+    A sub-daily collection (see :func:`_is_sub_daily`) is grouped by its
+    exact time stamp instead. Truncating hourly forecasts to the day
+    turned a 60-hour WeatherNext animation into three frames, each the
+    last hour of its day stamped 00:00.
 
     ``.mosaic()`` drops per-tile projection info — the mosaic result
     reports the WGS84 default (~111 km scale) instead of the source's
@@ -5189,8 +5218,21 @@ def _mosaic_by_date(col):
         _src_wkt = None
         _src_transform = None
 
+    try:
+        _times = col.aggregate_array("system:time_start").getInfo() or []
+    except Exception:
+        _times = []
+    _by_moment = _is_sub_daily(_times)
+    # One image per moment: nothing to mosaic, and the per-date
+    # filter-and-mosaic graph made each frame ~10x slower to render --
+    # enough to push a 60-frame hourly GIF past run_code's timeout.
+    if _by_moment and len(set(_times)) == len(_times):
+        return col.sort("system:time_start")
+
     # Get distinct dates
     def _add_date_millis(img):
+        if _by_moment:
+            return img.set("date_millis", img.get("system:time_start"))
         d = ee.Date(img.get("system:time_start"))
         # Truncate to start of day
         day_start = ee.Date.fromYMD(d.get("year"), d.get("month"), d.get("day"))

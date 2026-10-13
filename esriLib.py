@@ -1279,7 +1279,7 @@ def addEsriFeatureService(
     name: str | None = None,
     max_features: int = 1000,
     where: str = "1=1",
-    bbox: str | None = None,
+    bbox: str | list | tuple | None = None,
     token: str | None = None,
     target_map=None,
     # LOCAL PATCH esri generalise v1 (2026-09-17): server-side geometry
@@ -1331,8 +1331,10 @@ def addEsriFeatureService(
         where (str, optional): SQL WHERE clause sent to the service for
             server-side filtering.  Defaults to ``"1=1"`` (all features).
             Example: ``where="STATE_FIPS='06'"`` (California only).
-        bbox (str, optional): ``"xmin,ymin,xmax,ymax"`` in WGS84. Filters
-            the count as well as the fetch.
+        bbox (str, list or tuple, optional): Spatial filter,
+            ``"xmin,ymin,xmax,ymax"`` in WGS84 degrees, or the same four
+            numbers as a list or tuple. Filters the count as well as the
+            fetch.
         token (str, optional): ArcGIS token for secured services.
         max_allowable_offset (float, optional): Server-side geometry
             thinning, in degrees (the units of outSR 4326).
@@ -1404,6 +1406,12 @@ def addEsriFeatureService(
     _check_url(url)
 
     query_url = f"{url}{_FEATURE_QUERY_SUFFIX}"
+    # Ian (rcr/master 036dd9f): a 4-tuple is the natural spelling of a bbox
+    # in Python, but georest only parses the "xmin,ymin,xmax,ymax" string;
+    # a tuple goes out as "[-124.6, 41.9, ...]" and the service rejects the
+    # 'geometry' parameter. Here, before the count, so both requests get it.
+    if isinstance(bbox, (list, tuple)):
+        bbox = ",".join(str(v) for v in bbox)
     bbox_params = _bbox_params(bbox)
     # The count comes first, and from here, because it is what proves the
     # drawn layer whole (see _count_features). It also carries the
@@ -1553,6 +1561,12 @@ def addEsriFeatureServiceClassed(
     _check_url(url)
 
     query_url = f"{url}{_FEATURE_QUERY_SUFFIX}"
+    # Ian (rcr/master 036dd9f): a 4-tuple is the natural spelling of a bbox
+    # in Python, but georest only parses the "xmin,ymin,xmax,ymax" string;
+    # a tuple goes out as "[-124.6, 41.9, ...]" and the service rejects the
+    # 'geometry' parameter. Here, before the count, so both requests get it.
+    if isinstance(bbox, (list, tuple)):
+        bbox = ",".join(str(v) for v in bbox)
     bbox_params = _bbox_params(bbox)
     matched = _count_features(query_url, where, bbox_params, token,
                               max_features)

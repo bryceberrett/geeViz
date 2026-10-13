@@ -401,8 +401,8 @@ def test_min_lead_is_not_cached_across_collections():
 
 
 def test_an_empty_window_survives_as_a_masked_sentinel():
-    """WeatherNext 3 does not reach back to 2024, so this window is
-    legitimately empty. It must still come back with u/v bands.
+    """WeatherNext 3 starts in 2024 (MODELS archive_start), so a 2023
+    window is legitimately empty. It must still come back with u/v bands.
 
     Without the guard, ``addWindLayer`` dies several frames later on
     ``Image.bandNames: Parameter 'image' is required`` — which points at
@@ -410,7 +410,7 @@ def test_an_empty_window_survives_as_a_masked_sentinel():
     """
     import ee
     import geeViz.weather as wx
-    ic = wx.getForecastData("2024-09-26", "2024-09-27", "weathernext",
+    ic = wx.getForecastData("2023-09-26", "2023-09-27", "weathernext",
                             now=NOW)
     d = _summary(ic)
     assert d["n"] == 1, f"expected one sentinel, got {d['n']}"

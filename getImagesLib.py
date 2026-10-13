@@ -7491,6 +7491,192 @@ def superSimpleGetS2(
 
 #########################################################################
 #########################################################################
+# Fall foliage: color indices and change from a leaf-on baseline
+# Ported from AskTerra 1.0's terraFoliage (rcr_services ee_services
+# foliageIndices / getFoliageService).
+def foliageIndices(img: ee.Image) -> ee.Image:
+    """Add fall-foliage color indices to an image with ``red``, ``green``, ``blue`` and ``nir`` bands.
+
+    Adds ``yellowness`` (NDYI, (G-B)/(G+B)), ``orangeness``, ``redness``
+    ((R-G)/(R+G)), ``greenness`` ((G-R)/(G+R)), ``brownness`` and ``ndvi``.
+    Every index is a ratio, so the input scale (0-1 or 0-10000) does not
+    matter. Pixels whose visible bands sum to zero are masked.
+
+    Color on its own says little: different vegetation can read alike at
+    one date. Compare against a leaf-on baseline with
+    :func:`getFoliageChange` rather than reporting these values raw.
+
+    Args:
+        img (ee.Image): Image with ``red``, ``green``, ``blue`` and ``nir`` bands.
+
+    Returns:
+        ee.Image: The input image with the six index bands added.
+
+    Example:
+        >>> s2 = gil.superSimpleGetS2(area, '2026-09-20', '2026-10-08').median()
+        >>> fol = gil.foliageIndices(s2)
+    """
+    vizSum = img.select(["red", "green", "blue"]).reduce(ee.Reducer.sum())
+    img = img.updateMask(vizSum.selfMask())
+    bands = {"R": img.select("red"), "G": img.select("green"), "B": img.select("blue")}
+    yellowness = img.expression("(G - B) / (G + B)", bands).rename("yellowness")
+    orangeness = img.expression("((R - G) / (R + G + B + 1e-6)) * ((G - B) / (R + G + B + 1e-6))", bands).rename("orangeness")
+    redness = img.expression("(R - G) / (R + G)", bands).rename("redness")
+    greenness = img.expression("(G - R) / (G + R)", bands).rename("greenness")
+    brownness = img.expression("((R + G) / 2 - B) / (R + G + B)", bands).rename("brownness")
+    ndvi = img.normalizedDifference(["nir", "red"]).rename("ndvi")
+    return img.addBands([yellowness, orangeness, redness, greenness, brownness, ndvi])
+
+
+def _foliageDates(startDatePre=None, endDatePre=None, startDatePost=None, endDatePost=None,
+                  compositeDays=21, timeGap=42, today=None):
+    """Fill the pre (leaf-on) and post (foliage) windows for :func:`getFoliageChange`.
+
+    Returns four ``datetime`` objects. Raises ``ValueError`` when the pre
+    window does not end before the foliage window starts: a baseline that
+    overlaps the foliage dates measures nothing.
+    """
+    fmt = "%Y-%m-%d"
+
+    def _d(s):
+        return datetime.datetime.strptime(str(s).split("T")[0], fmt)
+
+    def _s(d):
+        return d.strftime(fmt)
+
+    # Post window
+    if startDatePost is None and endDatePost is None:
+        endPost = (today or datetime.datetime.now())
+        startPost = endPost - datetime.timedelta(days=compositeDays)
+    elif startDatePost is None:
+        endPost = _d(endDatePost)
+        startPost = endPost - datetime.timedelta(days=compositeDays)
+    elif endDatePost is None:
+        startPost = _d(startDatePost)
+        endPost = startPost + datetime.timedelta(days=compositeDays)
+    else:
+        startPost, endPost = _d(startDatePost), _d(endDatePost)
+    # Pre window
+    if startDatePre is None and endDatePre is None:
+        startPre = startPost - datetime.timedelta(days=timeGap)
+        endPre = endPost - datetime.timedelta(days=timeGap)
+    elif startDatePre is None:
+        endPre = _d(endDatePre)
+        startPre = endPre - datetime.timedelta(days=compositeDays)
+    elif endDatePre is None:
+        startPre = _d(startDatePre)
+        endPre = startPre + datetime.timedelta(days=compositeDays)
+    else:
+        startPre, endPre = _d(startDatePre), _d(endDatePre)
+    if endPre > startPost:
+        raise ValueError(
+            f"The pre (leaf-on) window {_s(startPre)} to {_s(endPre)} must end before "
+            f"the foliage window starts ({_s(startPost)})."
+        )
+
+    return startPre, endPre, startPost, endPost
+
+
+def getFoliageChange(
+    studyArea: ee.Geometry | ee.Feature | ee.FeatureCollection,
+    startDatePre: str | None = None,
+    endDatePre: str | None = None,
+    startDatePost: str | None = None,
+    endDatePost: str | None = None,
+    compositeDays: int = 21,
+    timeGap: int = 42,
+    includeLandsat: bool = True,
+    toaOrSR: str = "TOA",
+    yellowThresh: float = 0.1,
+    rednessThresh: float = 0.25,
+) -> dict:
+    """Fall foliage change: a foliage-window composite MINUS a leaf-on (pre) composite. **Use for any fall color / foliage question.**
+
+    The same method as AskTerra 1.0's terraFoliage. Builds two median
+    composites (Sentinel-2 via :func:`superSimpleGetS2`, merged with Landsat
+    when ``includeLandsat``), adds :func:`foliageIndices` to each, and
+    subtracts pre from post. Turning color is the CHANGE in yellowness and
+    redness from the leaf-on baseline, never the foliage-date values alone.
+
+    A baseline is necessary but not sufficient: the season shifts these
+    indices everywhere (sun angle, drying ground cover), including in
+    vegetation that never changes color. Before calling a stand turned,
+    compute the same change over a nearby type that keeps its color (an
+    evergreen class from the same land-cover source) and report the
+    difference, not the raw change.
+
+    Dates: ``post`` defaults to the last ``compositeDays`` days ending today;
+    ``pre`` defaults to the post window shifted back ``timeGap`` days. Give
+    any of the four to override; a missing partner date is filled from
+    ``compositeDays``.
+
+    Args:
+        studyArea (ee.Geometry | ee.Feature | ee.FeatureCollection): Area to composite over.
+        startDatePre (str, optional): Pre (leaf-on) window start, ``YYYY-MM-DD``.
+        endDatePre (str, optional): Pre window end, ``YYYY-MM-DD``.
+        startDatePost (str, optional): Foliage window start, ``YYYY-MM-DD``.
+        endDatePost (str, optional): Foliage window end, ``YYYY-MM-DD``. Defaults to today.
+        compositeDays (int, optional): Window length when a start or end is missing. Defaults to 21.
+        timeGap (int, optional): Days between the post and pre windows when pre is not given. Defaults to 42.
+        includeLandsat (bool, optional): Merge Landsat scenes (scaled to 0-10000) with Sentinel-2 to fill cloud gaps. Defaults to True.
+        toaOrSR (str, optional): "TOA" (AskTerra 1.0's choice, which the thresholds were tuned on) or "SR". The two can disagree in autumn, because top-of-atmosphere blue carries haze that grows as the sun drops; say which you used. Defaults to "TOA".
+        yellowThresh (float, optional): Minimum yellowness increase for the ``yellowing`` layer. Defaults to 0.1.
+        rednessThresh (float, optional): Minimum redness increase for the ``reddening`` layer. Defaults to 0.25.
+
+    Returns:
+        dict: ``pre`` and ``post`` (composites with index bands, 0-10000
+        reflectance), ``change`` (post minus pre, index bands only),
+        ``yellowing`` and ``reddening`` (the change in yellowness / redness,
+        masked below the thresholds), and ``dates`` (the four window dates
+        actually used).
+
+    Example:
+        >>> fol = gil.getFoliageChange(area)   # last 3 weeks vs 6 weeks earlier
+        >>> Map.addLayer(fol['post'], gil.vizParamsTrue10k, 'Now')
+        >>> Map.addLayer(fol['yellowing'], {'min': 0.1, 'max': 0.2, 'palette': ['888800', 'FFFF00']}, 'Yellowing')
+        >>> stats = fol['change'].select(['yellowness', 'redness']).reduceRegion(ee.Reducer.mean(), area, 30)
+    """
+    startPre, endPre, startPost, endPost = _foliageDates(
+        startDatePre, endDatePre, startDatePost, endDatePost, compositeDays, timeGap)
+    _s = lambda d: d.strftime("%Y-%m-%d")
+
+    common = ["blue", "green", "red", "nir", "swir1", "swir2"]
+
+    def _composite(start, end):
+        # Both sensors as float on one 0-10000 scale, or the merge is
+        # refused (S2 is integer, Landsat float 0-1).
+        s2 = superSimpleGetS2(studyArea, _s(start), _s(end), toaOrSR=toaOrSR).select(common).map(
+            lambda img: ee.Image(img.toFloat().copyProperties(img, ["system:time_start"]))
+        )
+        if includeLandsat:
+            ls = getProcessedLandsatScenes(studyArea, start.year, end.year, 1, 365, toaOrSR=toaOrSR)
+            ls = ls.filterDate(_s(start), _s(end)).select(common).map(
+                lambda img: ee.Image(img.multiply(10000).toFloat().copyProperties(img, ["system:time_start"]))
+            )
+            s2 = s2.merge(ls)
+        return foliageIndices(s2.median())
+
+    pre = _composite(startPre, endPre)
+    post = _composite(startPost, endPost)
+    idx = ["yellowness", "orangeness", "redness", "greenness", "brownness", "ndvi"]
+    change = post.select(idx).subtract(pre.select(idx))
+    yellowing = change.select("yellowness").updateMask(change.select("yellowness").gte(yellowThresh)).rename("yellowing")
+    reddening = change.select("redness").updateMask(change.select("redness").gte(rednessThresh)).rename("reddening")
+    return {
+        "pre": pre,
+        "post": post,
+        "change": change,
+        "yellowing": yellowing,
+        "reddening": reddening,
+        "dates": {
+            "startDatePre": _s(startPre), "endDatePre": _s(endPre),
+            "startDatePost": _s(startPost), "endDatePost": _s(endPost),
+        },
+    }
+
+
+#########################################################################
+#########################################################################
 # Wrapper function for getting Sentinel 2 imagery
 def getSentinel2Wrapper(
     studyArea,

@@ -83,10 +83,12 @@ def lcms_releases(*, product: str = "", refresh: bool = False) -> List[dict]:
       carrying only ``NLCD_Percent_Tree_Canopy_Cover``. "The latest
       release" is therefore ambiguous unless you say latest *of what* —
       see :func:`latest_release`.
-    * **Study areas differ, and not monotonically.** ``2024-10`` covers
-      CONUS, AK, HAWAII and PRUSVI; ``2025-11`` covers only CONUS and
-      AK. Work in Hawaii or Puerto Rico has to pin an *older* release,
-      which is the opposite of the usual advice.
+    * **The API's summaries cover less than the imagery.** The API's
+      pre-computed summaries for ``2025-11`` list only CONUS and AK,
+      while the ``2025-11`` Earth Engine asset itself covers CONUS, AK,
+      HI and PRUSVI through 2025. For Hawaii or Puerto Rico, summarize
+      the asset over a geometry (the Earth Engine path) rather than pin
+      an older release for the API.
 
     Note also that ``2022-8`` reports ``SummaryAreaCount = 0`` — it has
     no summary areas, so the API cannot answer area queries against it
@@ -458,9 +460,8 @@ def _summary_from_ee(product: str, geometry: Any, *, scale: int,
         # bare KeyError naming none of the real problem.
         logger.warning(
             "fsInsights: LCMS/%s returned no pixels for this geometry. "
-            "Check it falls inside the release's study areas - release "
-            "2025-11 covers only CONUS and AK, while 2024-10 also covers "
-            "HAWAII and PRUSVI.", product,
+            "Check it falls inside the release's study areas (release "
+            "2025-11 in Earth Engine covers CONUS, AK, HI and PRUSVI).", product,
         )
     return _frame(records or [], columns=_SUMMARY_COLUMNS)
 

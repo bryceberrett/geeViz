@@ -345,14 +345,13 @@ def test_no_lcms_year_range_ends_before_2025():
             assert end >= 2025, f"stale LCMS year range: {line.strip()[:120]}"
 
 
-def test_the_hawaii_exception_survives():
-    """Coverage is not monotonic: HAWAII and PRUSVI exist only in the
-    older release, so a blanket 'always use the newest' instruction
-    would break those. Deleting the caveat is the likely future
-    mistake."""
-    assert "v2024-10" in INSTR, (
-        "the older release is no longer mentioned at all — work in "
-        "Hawaii or Puerto Rico has no id to pin")
-    low = INSTR.lower()
-    assert "hawaii" in low or "puerto rico" in low, (
-        "the non-monotonic coverage caveat is gone")
+def test_nothing_sends_work_to_a_deprecated_lcms_release():
+    """The instructions once told the agent to pin the deprecated
+    v2024-10 for Hawaii and Puerto Rico. The current 2025-11 asset covers
+    both through 2025, so that advice cost those users a year of data.
+    What stays true, and is kept: study-area names differ by release, so
+    read them from the collection before filtering."""
+    row = next(l for l in INSTR.splitlines() if l.startswith('| "LCMS"'))
+    assert "v2024-10" not in row and "pin" not in row.lower()
+    assert "Hawaii" in row and "Puerto Rico" in row
+    assert "aggregate_histogram('study_area')" in row

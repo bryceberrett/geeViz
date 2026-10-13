@@ -149,8 +149,8 @@ def test_the_empty_window_sentinel_carries_the_requested_bands():
     """A caller that selects by name must not die on the empty case."""
     import ee
     import geeViz.weather as wx
-    # WeatherNext 3 does not reach back to 2024.
-    ic = wx.getForecastData("2024-09-26", "2024-09-27", "weathernext",
+    # WeatherNext 3 starts in 2024 (MODELS archive_start).
+    ic = wx.getForecastData("2023-09-26", "2023-09-27", "weathernext",
                             variable="temperature_2m")
     img = ee.Image(ic.first())
     assert img.bandNames().getInfo() == ["temperature_2m"]
